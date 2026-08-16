@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Add `inbox-send-active`, a current-conversation-only single text sender requiring a named header match, exact text, and `--confirm-send`. It has no recipient search, batch queue, attachment, status action, scheduling, or automatic retry; post-send verification checks the outgoing text count once.
+- Correct active-chat logical message classification for BOSS `item-myself` and `item-system` rows, reporting outgoing text and system events separately from incoming text.
+- Harden `inbox-read-active` contact verification: the expected name must occur in the main conversation header, not merely in the left contact list. Abort before reading if the active header does not match.
+- Add `inbox-read-active`: an explicit, named-contact verified, current-view-only conversation reader. It attaches to an already open dedicated Chrome chat page and extracts logical rendered message rows/types without navigating, clicking, scrolling, writing a chat transcript to disk, or sending.
+- Extend read-only `inbox-discover` with WebSocket envelope/schema summaries. It reports protocol keys and frame direction only, never chat body values, attachment URLs, recruiter names, or opaque identifiers embedded in frames.
+- Add `--mode homepage` to capture the homepage's native personalized/latest-job responses without controlling the user's main browser; map `sortType=1/2` to `selected/latest`, retain response provenance, and deduplicate the flattened job list.
+- Add privacy-minimizing `--mode inbox` and `inbox-discover`: native conversation-list monitoring can return company/job/unread/last-activity metadata while excluding recruiter names, previews, and message bodies. Automatic message sending is intentionally out of scope.
+- Capture native BOSS list-page network responses instead of injecting a second synchronous XHR.
+- Make `--check` local-only and remove automatic login-probe requests from setup.
+- Remove injected page scripts and synthetic mouse events from the normal CDP path.
+- Add direct-link detail metadata fallback, visible internship-constraint tags, and detail `--stream-json` NDJSON output.
+- Make JSON writes atomic and keep Windows PowerShell/subprocess handling stable.
+- Reduce unnecessary waiting: remove list-page scrolling, use 8–15s page/detail gaps, and retry detail scrolling only when the JD section is not yet available.
+
 ## 未发布
 
 ### 新增

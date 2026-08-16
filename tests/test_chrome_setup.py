@@ -43,13 +43,12 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("boss_jobs_", module.default_output_path("jobs"))
         self.assertIn("boss_details_", module.default_output_path("details"))
 
-    def test_create_page_session_defaults_to_background_with_visibility_override(self):
+    def test_create_page_session_uses_normal_foreground_target_without_script_injection(self):
         module = load_module()
         cdp = mock.Mock()
         cdp.send.side_effect = [
             {"result": {"targetId": "target-1"}},
             {"result": {"sessionId": "session-1"}},
-            {"result": {}},
         ]
 
         result = module.create_page_session(cdp)
@@ -60,16 +59,11 @@ class ChromeSetupTests(unittest.TestCase):
             [
                 mock.call(
                     "Target.createTarget",
-                    {"url": "about:blank", "background": True},
+                    {"url": "about:blank", "background": False},
                 ),
                 mock.call(
                     "Target.attachToTarget",
                     {"targetId": "target-1", "flatten": True},
-                ),
-                mock.call(
-                    "Page.addScriptToEvaluateOnNewDocument",
-                    {"source": module.BACKGROUND_VISIBILITY_SCRIPT},
-                    "session-1",
                 ),
             ],
         )
@@ -104,42 +98,6 @@ class ChromeSetupTests(unittest.TestCase):
                 ),
             ],
         )
-
-    def test_wait_for_login_explicitly_uses_foreground_target(self):
-        module = load_module()
-        cdp = mock.Mock()
-        with mock.patch.object(module, "CDPSession", return_value=cdp), \
-                mock.patch.object(
-                    module,
-                    "create_page_session",
-                    return_value=("login-target", "login-session"),
-                ) as create_session, \
-                mock.patch.object(
-                    module,
-                    "probe_login_state",
-                    return_value=module.LoginProbeResult(module.LoginProbeStatus.AVAILABLE),
-                ):
-            self.assertTrue(module.wait_for_login(cdp_port=9333, timeout=1))
-
-        create_session.assert_called_once_with(
-            cdp,
-            background=False,
-        )
-        self.assertEqual(
-            cdp.send.call_args_list,
-            [
-                mock.call(
-                    "Page.navigate",
-                    {"url": "https://www.zhipin.com/web/user/"},
-                    "login-session",
-                ),
-                mock.call(
-                    "Target.closeTarget",
-                    {"targetId": "login-target"},
-                ),
-            ],
-        )
-        cdp.close.assert_called_once_with()
 
     def test_default_city_is_shanghai_when_not_provided(self):
         module = load_module()
@@ -275,8 +233,8 @@ class ChromeSetupTests(unittest.TestCase):
                                         "code=35"):
                 module.fetch_boss_json(module.HOT_CITY_URL)
 
-    def test_main_rejects_unknown_city_before_login_probe(self):
-        """CLI 城市预校验失败后以非零状态退出，不进入登录探测。"""
+    def test_main_rejects_unknown_city_before_search(self):
+        """CLI 城市预校验失败后以非零状态退出，不进入目标搜索。"""
         module = load_module()
 
         with mock.patch.object(sys, "argv", [
@@ -286,14 +244,12 @@ class ChromeSetupTests(unittest.TestCase):
                                return_value=True), \
              mock.patch.object(module, "resolve_city",
                                side_effect=module.CityResolutionError("无法解析城市")), \
-             mock.patch.object(module, "check_login_state") as login_probe, \
              redirect_stdout(io.StringIO()) as output:
             with self.assertRaises(SystemExit) as exit_context:
                 module.main()
 
         self.assertEqual(exit_context.exception.code, 1)
         self.assertIn("无法解析城市", output.getvalue())
-        login_probe.assert_not_called()
 
     def test_resolve_city_empty_input(self):
         module = load_module()
@@ -383,105 +339,20 @@ class ChromeSetupTests(unittest.TestCase):
             },
         )
 
-    def test_login_probe_requires_plaintext_salary(self):
-        module = load_module()
-
-        hidden_salary = {"code": 0, "zpData": {"jobList": [{"jobName": "Java", "salaryDesc": ""}]}}
-        visible_salary = {"code": 0, "zpData": {"jobList": [{"jobName": "Java", "salaryDesc": "20-40K"}]}}
-
-        self.assertFalse(module.is_logged_in_search_response(hidden_salary))
-        self.assertTrue(module.is_logged_in_search_response(visible_salary))
-        self.assertFalse(module.is_logged_in_search_response({"code": 7, "zpData": {"jobList": []}}))
-
-    def test_login_probe_classifies_distinct_failure_states(self):
-        module = load_module()
-
-        cases = [
-            (
-                {"code": 0, "zpData": {"jobList": [{"salaryDesc": "20-40K"}]}},
-                module.LoginProbeStatus.AVAILABLE,
-            ),
-            (
-                {"code": 0, "zpData": {"jobList": [{"salaryDesc": ""}]}},
-                module.LoginProbeStatus.UNAUTHENTICATED,
-            ),
-            (
-                {"code": 0, "zpData": {"jobList": []}},
-                module.LoginProbeStatus.EMPTY,
-            ),
-            (
-                {"code": 31, "message": "访问受限"},
-                module.LoginProbeStatus.RESTRICTED,
-            ),
-            (
-                # 实测风控码：已登录但被 BOSS 判「环境存在异常」（issue #33）
-                {"code": 37, "message": "您的环境存在异常."},
-                module.LoginProbeStatus.RESTRICTED,
-            ),
-            (
-                # 未知风控码但 message 命中风控关键词，兜底归 RESTRICTED
-                {"code": 9999, "message": "检测到访问频繁，请稍后再试"},
-                module.LoginProbeStatus.RESTRICTED,
-            ),
-            (
-                {"code": 7, "message": "业务异常"},
-                module.LoginProbeStatus.RESPONSE_ERROR,
-            ),
-        ]
-
-        for response, expected in cases:
-            with self.subTest(expected=expected):
-                result = module.classify_login_probe_response(response)
-                self.assertIs(result.status, expected)
-
-        restricted = module.classify_login_probe_response({"code": 31, "message": "访问受限"})
-        self.assertEqual(restricted.code, 31)
-        self.assertEqual(restricted.message, "访问受限")
-
-        # 已登录但被风控（issue #33）：必须归 RESTRICTED 而非误判为登录失败
-        risk_control = module.classify_login_probe_response(
-            {"code": 37, "message": "您的环境存在异常."}
-        )
-        self.assertIs(risk_control.status, module.LoginProbeStatus.RESTRICTED)
-        self.assertEqual(risk_control.code, 37)
-
-    def test_login_probe_classifies_http_failures(self):
-        module = load_module()
-
-        self.assertIs(
-            module.classify_login_probe_response({}, http_status=401).status,
-            module.LoginProbeStatus.UNAUTHENTICATED,
-        )
-        self.assertIs(
-            module.classify_login_probe_response({}, http_status=429).status,
-            module.LoginProbeStatus.RESTRICTED,
-        )
-        server_error = module.classify_login_probe_response({}, http_status=503)
-        self.assertIs(server_error.status, module.LoginProbeStatus.RESPONSE_ERROR)
-        self.assertTrue(server_error.retryable)
-
-    def test_run_check_reports_restriction_instead_of_logged_out(self):
+    def test_run_check_is_local_only_and_does_not_probe_boss(self):
         module = load_module()
         response = mock.Mock()
         response.json.return_value = {"Browser": "Chrome/140"}
-        restricted = module.LoginProbeResult(
-            module.LoginProbeStatus.RESTRICTED,
-            code=31,
-            message="访问受限",
-        )
         requests_mock = mock.Mock()
         requests_mock.get.return_value = response
         stdout = io.StringIO()
         with mock.patch.object(module, "require_runtime_dependencies", return_value=True), \
                 mock.patch.object(module, "requests", requests_mock), \
-                mock.patch.object(module, "check_login_state", return_value=restricted), \
                 redirect_stdout(stdout):
-            self.assertEqual(module.run_check(cdp_port=9333), 1)
+            self.assertEqual(module.run_check(cdp_port=9333), 0)
 
         output = stdout.getvalue()
-        self.assertIn("限制状态", output)
-        self.assertIn("code: 31", output)
-        self.assertNotIn("未登录 —", output)
+        self.assertIn("未主动探测", output)
 
     def test_detail_record_preserves_job_id_and_job_link(self):
         module = load_module()
@@ -667,14 +538,6 @@ class ChromeSetupTests(unittest.TestCase):
             "",
         )
 
-    def test_fetch_api_js_maps_bossonline_fallback(self):
-        module = load_module()
-        js = module.FETCH_API_JS_TEMPLATE
-
-        self.assertIn("j.activeTimeDesc", js)
-        self.assertIn("j.bossOnline", js)
-        self.assertIn("boss_active_status: j.activeTimeDesc || (j.bossOnline ?", js)
-
     def test_extract_job_description_removes_recruiter_card_before_safety_footer(self):
         module = load_module()
         description = "负责视觉算法研发、模型部署和业务场景落地。\n" * 8
@@ -723,13 +586,6 @@ class ChromeSetupTests(unittest.TestCase):
             "https://www.zhipin.com/job_detail/abc.html?lid=lid-123&securityId=sec+value",
         )
 
-    def test_api_extraction_keeps_detail_context_fields(self):
-        module = load_module()
-
-        self.assertIn("security_id: j.securityId", module.FETCH_API_JS_TEMPLATE)
-        self.assertIn("lid: j.lid", module.FETCH_API_JS_TEMPLATE)
-        self.assertIn("encrypt_job_id: j.encryptJobId", module.FETCH_API_JS_TEMPLATE)
-
     def test_dom_fallback_is_opt_in(self):
         module = load_module()
 
@@ -745,178 +601,6 @@ class ChromeSetupTests(unittest.TestCase):
             module.parse_api_jobs_eval_value(json.dumps([{"title": "Java", "job_link": "https://example.com"}])),
             [{"title": "Java", "job_link": "https://example.com"}],
         )
-
-    def test_login_probe_uses_one_budgeted_request(self):
-        module = load_module()
-        cdp = mock.Mock()
-        cdp.eval_js.return_value = json.dumps({
-            "httpStatus": 200,
-            "body": json.dumps({
-                "code": 0,
-                "zpData": {"jobList": [{"jobName": "Java", "salaryDesc": "20-40K"}]},
-            }),
-        })
-        module._request_counter = 0
-
-        result = module.probe_login_state(cdp, "sid", query="Java", city_code="101020100")
-
-        self.assertIs(result.status, module.LoginProbeStatus.AVAILABLE)
-        self.assertEqual(cdp.eval_js.call_count, 1)
-        self.assertEqual(module._request_counter, 1)
-        probe_js = cdp.eval_js.call_args.args[0]
-        self.assertIn("query=Java", probe_js)
-        self.assertIn("city=101020100", probe_js)
-
-    def test_wait_for_login_rotates_targets_and_backs_off(self):
-        module = load_module()
-        cdp = mock.Mock()
-        results = [
-            module.LoginProbeResult(module.LoginProbeStatus.EMPTY),
-            module.LoginProbeResult(module.LoginProbeStatus.AVAILABLE),
-        ]
-        with mock.patch.object(module, "CDPSession", return_value=cdp), \
-                mock.patch.object(
-                    module,
-                    "create_page_session",
-                    return_value=("login-target", "login-session"),
-                ), \
-                mock.patch.object(module, "probe_login_state", side_effect=results) as probe, \
-                mock.patch.object(module.time, "sleep") as sleep:
-            self.assertTrue(module.wait_for_login(cdp_port=9333, timeout=10, interval=3))
-
-        self.assertEqual(
-            probe.call_args_list,
-            [
-                mock.call(
-                    cdp,
-                    "login-session",
-                    query=module.LOGIN_PROBE_TARGETS[0][0],
-                    city_code=module.LOGIN_PROBE_TARGETS[0][1],
-                ),
-                mock.call(
-                    cdp,
-                    "login-session",
-                    query=module.LOGIN_PROBE_TARGETS[1][0],
-                    city_code=module.LOGIN_PROBE_TARGETS[1][1],
-                ),
-            ],
-        )
-        sleep.assert_called_once()
-        self.assertAlmostEqual(sleep.call_args.args[0], 3, delta=0.1)
-
-    def test_wait_for_login_stops_immediately_when_restricted(self):
-        module = load_module()
-        cdp = mock.Mock()
-        restricted = module.LoginProbeResult(
-            module.LoginProbeStatus.RESTRICTED,
-            code=31,
-            message="访问受限",
-        )
-        stdout = io.StringIO()
-        with mock.patch.object(module, "CDPSession", return_value=cdp), \
-                mock.patch.object(
-                    module,
-                    "create_page_session",
-                    return_value=("login-target", "login-session"),
-                ), \
-                mock.patch.object(module, "probe_login_state", return_value=restricted) as probe, \
-                mock.patch.object(module.time, "sleep") as sleep, \
-                redirect_stdout(stdout):
-            self.assertFalse(module.wait_for_login(cdp_port=9333, timeout=300))
-
-        probe.assert_called_once()
-        sleep.assert_not_called()
-        self.assertIn("code: 31", stdout.getvalue())
-        self.assertIn("已停止登录探测", stdout.getvalue())
-
-    def test_wait_for_login_treats_code37_risk_control_as_restricted(self):
-        # issue #33：已登录但被 BOSS 风控（code 37「您的环境存在异常」），
-        # 必须走 RESTRICTED 文案分支，而非误判为不可恢复的登录失败。
-        module = load_module()
-        cdp = mock.Mock()
-        restricted = module.LoginProbeResult(
-            module.LoginProbeStatus.RESTRICTED,
-            code=37,
-            message="您的环境存在异常.",
-        )
-        stdout = io.StringIO()
-        with mock.patch.object(module, "CDPSession", return_value=cdp), \
-                mock.patch.object(
-                    module,
-                    "create_page_session",
-                    return_value=("login-target", "login-session"),
-                ), \
-                mock.patch.object(module, "probe_login_state", return_value=restricted) as probe, \
-                mock.patch.object(module.time, "sleep") as sleep, \
-                redirect_stdout(stdout):
-            self.assertFalse(module.wait_for_login(cdp_port=9333, timeout=300))
-
-        probe.assert_called_once()
-        sleep.assert_not_called()
-        output = stdout.getvalue()
-        self.assertIn("code: 37", output)
-        self.assertIn("已停止登录探测", output)
-        # 应提示用户「完成验证/稍后再试」，而不是误导性的「登录探测响应异常」
-        self.assertIn("请先在浏览器中完成验证或稍后再试", output)
-        self.assertNotIn("登录探测响应异常", output)
-
-    def test_wait_for_login_limits_transient_response_errors(self):
-        module = load_module()
-        cdp = mock.Mock()
-        transient_error = module.LoginProbeResult(
-            module.LoginProbeStatus.RESPONSE_ERROR,
-            message="响应为空",
-            retryable=True,
-        )
-        stdout = io.StringIO()
-        with mock.patch.object(module, "CDPSession", return_value=cdp), \
-                mock.patch.object(
-                    module,
-                    "create_page_session",
-                    return_value=("login-target", "login-session"),
-                ), \
-                mock.patch.object(
-                    module,
-                    "probe_login_state",
-                    return_value=transient_error,
-                ) as probe, \
-                mock.patch.object(module.time, "sleep") as sleep, \
-                redirect_stdout(stdout):
-            self.assertFalse(module.wait_for_login(cdp_port=9333, timeout=300))
-
-        self.assertEqual(probe.call_count, module.LOGIN_PROBE_MAX_TRANSIENT_ERRORS + 1)
-        self.assertEqual(sleep.call_count, module.LOGIN_PROBE_MAX_TRANSIENT_ERRORS)
-        self.assertIn("连续异常次数过多", stdout.getvalue())
-
-    def test_find_latest_detail_file_uses_default_result_dir(self):
-        module = load_module()
-        with tempfile_profile() as paths:
-            result_dir = paths["cdp_profile"] / "job-result"
-            result_dir.mkdir(parents=True)
-            older = result_dir / "boss_details_20260612_1000.json"
-            newer = result_dir / "boss_details_20260612_1100.json"
-            older.write_text("[]", encoding="utf-8")
-            newer.write_text("[]", encoding="utf-8")
-
-            self.assertEqual(module.find_latest_detail_file(str(result_dir)), str(newer))
-
-    def test_existing_detail_loader_prefers_sibling_detail_file(self):
-        module = load_module()
-        with tempfile_profile() as paths:
-            result_dir = paths["cdp_profile"] / "job-result"
-            result_dir.mkdir(parents=True)
-            list_path = result_dir / "boss_jobs_20260612_1100.json"
-            detail_path = result_dir / "boss_details_20260612_1100.json"
-            list_path.write_text('{"jobs":[]}', encoding="utf-8")
-            detail_path.write_text('[{"job_id":"abc123"}]', encoding="utf-8")
-
-            details = module.load_existing_details(
-                input_path=str(list_path),
-                detail_output=None,
-                result_dir=str(result_dir),
-            )
-
-        self.assertEqual(details, [{"job_id": "abc123"}])
 
     def test_windows_default_paths_use_localappdata(self):
         module = load_module()
@@ -1081,8 +765,7 @@ class ChromeSetupTests(unittest.TestCase):
                     mock.patch.object(module.shutil, "copy2", side_effect=lambda src, dst: calls["copy2"].append((src, dst))), \
                     mock.patch.object(module.subprocess, "run", side_effect=lambda *args, **kwargs: fake_run(calls, *args, **kwargs)), \
                     mock.patch.object(module.subprocess, "Popen", side_effect=lambda cmd, **kwargs: calls["popen"].append(cmd)), \
-                    mock.patch.object(module.time, "sleep", return_value=None), \
-                    mock.patch.object(module, "wait_for_login", return_value=True) as wait_login:
+                    mock.patch.object(module.time, "sleep", return_value=None):
                 fake_requests.get.side_effect = fake_get
                 self.assertEqual(module.run_setup_chrome(cdp_port=9333), 0)
 
@@ -1091,7 +774,25 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertTrue(calls["popen"])
         launched = calls["popen"][0]
         self.assertIn(expected_profile_arg, launched)
-        wait_login.assert_called_once_with(9333, timeout=module.DEFAULT_LOGIN_TIMEOUT)
+
+    def test_console_encoding_uses_utf8_with_replacement_when_supported(self):
+        module = load_module()
+
+        class FakeStream:
+            def __init__(self):
+                self.calls = []
+
+            def reconfigure(self, **kwargs):
+                self.calls.append(kwargs)
+
+        stdout = FakeStream()
+        stderr = FakeStream()
+        with mock.patch.object(module.sys, "stdout", stdout), \
+                mock.patch.object(module.sys, "stderr", stderr):
+            module.configure_console_encoding()
+
+        self.assertEqual(stdout.calls, [{"encoding": "utf-8", "errors": "replace"}])
+        self.assertEqual(stderr.calls, [{"encoding": "utf-8", "errors": "replace"}])
 
     def test_copy_login_state_is_explicit_and_does_not_copy_password_databases(self):
         module = load_module()
@@ -1143,14 +844,12 @@ class ChromeSetupTests(unittest.TestCase):
             with mock.patch.object(module, "DEFAULT_CDP_DATA_DIR", str(paths["cdp_profile"])), \
                     mock.patch.object(module, "requests", fake_requests), \
                     mock.patch.object(module.subprocess, "run", return_value=type("Completed", (), {"stdout": ps_output, "returncode": 0})()), \
-                    mock.patch.object(module.subprocess, "Popen") as popen, \
-                    mock.patch.object(module, "wait_for_login", return_value=True) as wait_login:
+                    mock.patch.object(module.subprocess, "Popen") as popen:
                 self.assertEqual(module.run_setup_chrome(cdp_port=9333), 0)
 
         popen.assert_not_called()
-        wait_login.assert_called_once_with(9333, timeout=module.DEFAULT_LOGIN_TIMEOUT)
 
-    def test_setup_can_skip_waiting_for_login(self):
+    def test_setup_does_not_probe_login_automatically(self):
         module = load_module()
         fake_requests = mock.Mock()
         fake_requests.get.return_value = type("Resp", (), {"status_code": 200})()
@@ -1162,11 +861,8 @@ class ChromeSetupTests(unittest.TestCase):
             )
             with mock.patch.object(module, "DEFAULT_CDP_DATA_DIR", str(paths["cdp_profile"])), \
                     mock.patch.object(module, "requests", fake_requests), \
-                    mock.patch.object(module.subprocess, "run", return_value=type("Completed", (), {"stdout": ps_output, "returncode": 0})()), \
-                    mock.patch.object(module, "wait_for_login") as wait_login:
-                self.assertEqual(module.run_setup_chrome(cdp_port=9333, wait_login=False), 0)
-
-        wait_login.assert_not_called()
+                    mock.patch.object(module.subprocess, "run", return_value=type("Completed", (), {"stdout": ps_output, "returncode": 0})()):
+                self.assertEqual(module.run_setup_chrome(cdp_port=9333), 0)
 
     def test_chrome_process_parsing_matches_unquoted_user_data_dir(self):
         module = load_module()
@@ -1272,14 +968,14 @@ class ChromeSetupTests(unittest.TestCase):
             [sys.executable, str(SCRIPT_PATH), "--help"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("--setup-chrome", result.stdout)
         self.assertIn("--reset-chrome-profile", result.stdout)
-        self.assertIn("--no-wait-login", result.stdout)
-        self.assertIn("--login-timeout", result.stdout)
         self.assertIn("--stop-chrome", result.stdout)
         self.assertIn("--close-chrome", result.stdout)
 
@@ -1372,6 +1068,318 @@ class VersionConsistencyTests(unittest.TestCase):
                          f"脚本({script_ver}) 与 SKILL.md({skill_ver}) 版本不一致")
         self.assertEqual(script_ver, readme_ver,
                          f"脚本({script_ver}) 与 README.md({readme_ver}) 版本不一致")
+
+
+class NativeFlowRegressionTests(unittest.TestCase):
+    def test_legacy_probe_and_injected_xhr_branches_are_removed(self):
+        module = load_module()
+        for name in (
+            "LoginProbeStatus",
+            "LoginProbeResult",
+            "probe_login_state",
+            "check_login_state",
+            "FETCH_API_JS_TEMPLATE",
+        ):
+            self.assertFalse(hasattr(module, name), name)
+        self.assertNotIn("XMLHttpRequest", module.EXTRACT_DETAIL_JS)
+
+    def test_detail_field_normalization_removes_map_ui_suffix(self):
+        module = load_module()
+        fields = module.extract_detail_fields({
+            "jd": "职位描述\n" + ("负责 Agent 应用开发。" * 20),
+            "location": "北京海淀区丽金智地中心\n\n点击查看地图",
+            "company_link": "https://www.zhipin.com/gongsi/company.html",
+        }, min_length=10)
+        self.assertEqual(fields["location"], "北京海淀区丽金智地中心")
+
+    def test_direct_link_detail_record_fills_page_metadata(self):
+        module = load_module()
+        detail = module.build_detail_record(
+            {"job_id": "abc", "job_link": "https://www.zhipin.com/job_detail/abc.html"},
+            {
+                "title": "Agent 实习生",
+                "company": "示例公司",
+                "salary": "300-400元/天",
+                "location": "北京·海淀区",
+                "company_link": "https://www.zhipin.com/gongsi/company.html",
+                "tags": ["Python", "本科"],
+                "jd": "负责 Agent 应用开发。" * 40,
+                "boss_active_status": "今日活跃",
+            },
+        )
+        self.assertEqual(detail["title"], "Agent 实习生")
+        self.assertEqual(detail["company"], "示例公司")
+        self.assertEqual(detail["salary"], "300-400元/天")
+        self.assertEqual(detail["salary_source"], "detail_dom")
+        self.assertEqual(detail["location"], "北京·海淀区")
+        self.assertEqual(detail["tags_list"], "Python | 本科")
+        self.assertEqual(detail["company_link"], "https://www.zhipin.com/gongsi/company.html")
+
+    def test_detail_extractor_captures_visible_internship_constraints(self):
+        module = load_module()
+        self.assertIn(".job-limit span", module.EXTRACT_DETAIL_JS)
+        self.assertIn("优秀论文优先", module.EXTRACT_DETAIL_JS)
+        self.assertIn("工作(?:时长)?", module.EXTRACT_DETAIL_JS)
+
+    def test_native_api_normalizer_rejects_business_error(self):
+        module = load_module()
+        with self.assertRaises(module.BossAPIError) as ctx:
+            module.normalize_api_jobs({"code": 37, "message": "您的环境存在异常"})
+        self.assertEqual(ctx.exception.code, 37)
+
+    def test_homepage_payload_extracts_nested_selected_and_latest_jobs(self):
+        module = load_module()
+        payload = {
+            "code": 0,
+            "zpData": {
+                "recommendJobList": [{
+                    "jobName": "Agent 实习生",
+                    "encryptJobId": "selected-id",
+                    "salaryDesc": "300-400元/天",
+                    "brandName": "示例公司",
+                    "cityName": "成都",
+                }],
+                "latestJobList": [{
+                    "jobInfo": {
+                        "jobName": "大模型算法实习生",
+                        "encryptJobId": "latest-id",
+                        "salaryDesc": "400-500元/天",
+                        "brandName": "新公司",
+                        "cityName": "成都",
+                    }
+                }],
+            },
+        }
+
+        jobs, sources = module.normalize_homepage_payload(
+            payload, "https://www.zhipin.com/wapi/zpgeek/recommend/job/list.json"
+        )
+
+        self.assertEqual([job["title"] for job in jobs], [
+            "Agent 实习生", "大模型算法实习生",
+        ])
+        self.assertEqual(jobs[0]["homepage_section"], "selected")
+        self.assertEqual(jobs[1]["homepage_section"], "latest")
+        self.assertEqual({source["section"] for source in sources}, {"selected", "latest"})
+
+    def test_homepage_payload_rejects_business_error(self):
+        module = load_module()
+        with self.assertRaises(module.BossAPIError) as ctx:
+            module.normalize_homepage_payload({"code": 37, "message": "您的环境存在异常"})
+        self.assertEqual(ctx.exception.code, 37)
+
+    def test_homepage_sort_type_maps_to_visible_sections(self):
+        module = load_module()
+        base = "https://www.zhipin.com/wapi/zpgeek/recommend/job/list.json"
+        self.assertEqual(
+            module.classify_homepage_section(base + "?sortType=1&page=1", "$.zpData.jobList"),
+            "selected",
+        )
+        self.assertEqual(
+            module.classify_homepage_section(base + "?sortType=2&page=1", "$.zpData.jobList"),
+            "latest",
+        )
+
+    def test_homepage_capture_stops_after_both_native_sections_arrive(self):
+        module = load_module()
+        base = "https://www.zhipin.com/wapi/zpgeek/recommend/job/list.json"
+        cdp = mock.Mock()
+        cdp.recv_event.side_effect = [
+            {"method": "Network.responseReceived", "params": {
+                "requestId": "selected", "response": {
+                    "url": base + "?sortType=1&page=1", "mimeType": "application/json",
+                },
+            }},
+            {"method": "Network.loadingFinished", "params": {"requestId": "selected"}},
+            {"method": "Network.responseReceived", "params": {
+                "requestId": "latest", "response": {
+                    "url": base + "?sortType=2&page=1", "mimeType": "application/json",
+                },
+            }},
+            {"method": "Network.loadingFinished", "params": {"requestId": "latest"}},
+        ]
+
+        def response_body(_method, params, _sid, timeout=10):
+            item = {
+                "jobName": params["requestId"],
+                "encryptJobId": params["requestId"] + "-id",
+                "salaryDesc": "300-400元/天",
+                "brandName": "示例公司",
+                "cityName": "成都",
+            }
+            return {"result": {"body": json.dumps({
+                "code": 0, "zpData": {"jobList": [item]},
+            })}}
+
+        cdp.send.side_effect = response_body
+        jobs, sources = module.wait_for_homepage_job_responses(cdp, "sid", timeout=5)
+
+        self.assertEqual([job["homepage_section"] for job in jobs], ["selected", "latest"])
+        self.assertEqual(len(sources), 2)
+        self.assertEqual(cdp.recv_event.call_count, 4)
+
+    def test_inbox_schema_summary_keeps_only_keys_not_private_values(self):
+        module = load_module()
+        shapes = module.json_list_shapes({
+            "conversationList": [{
+                "encryptJobId": "private-job-id",
+                "lastMessage": "private preview",
+                "userName": "private person",
+            }],
+        })
+        rendered = json.dumps(shapes, ensure_ascii=False)
+        self.assertIn("conversationList", rendered)
+        self.assertIn("lastMessage", rendered)
+        self.assertNotIn("private preview", rendered)
+        self.assertNotIn("private person", rendered)
+
+    def test_websocket_schema_keeps_keys_but_removes_chat_text(self):
+        module = load_module()
+        schema = module.websocket_payload_schema(json.dumps({
+            "type": "message",
+            "data": {
+                "content": "这是一条不应输出的私聊正文",
+                "sender": "private recruiter",
+                "messageId": "opaque-id",
+            },
+        }, ensure_ascii=False))
+        rendered = json.dumps(schema, ensure_ascii=False)
+        self.assertEqual(schema["encoding"], "json")
+        self.assertIn("data", rendered)
+        self.assertIn("content", rendered)
+        self.assertNotIn("不应输出", rendered)
+        self.assertNotIn("private recruiter", rendered)
+        self.assertNotIn("opaque-id", rendered)
+
+    def test_active_inbox_read_attaches_without_navigation_or_input(self):
+        module = load_module()
+        cdp = mock.Mock()
+
+        def send(method, params=None, sid=None, timeout=30):
+            if method == "Target.getTargets":
+                return {"result": {"targetInfos": [{
+                    "targetId": "chat-target",
+                    "type": "page",
+                    "url": "https://www.zhipin.com/web/geek/chat",
+                }]}}
+            if method == "Target.attachToTarget":
+                return {"result": {"sessionId": "chat-session"}}
+            return {"result": {}}
+
+        cdp.send.side_effect = send
+        cdp.eval_js.return_value = json.dumps({
+            "expected_contact_in_active_header": True,
+            "active_header": {"text": "刘姗｜HR", "top": 20, "left": 600},
+            "rendered_entries": [
+                {"type": "text_or_card", "text": "测试消息", "image_count": 0, "link_count": 0},
+                {"type": "image_or_attachment", "text": "", "image_count": 1, "link_count": 0},
+            ],
+            "composer_controls": [{"tag": "textarea", "placeholder": ""}],
+        }, ensure_ascii=False)
+
+        with mock.patch.object(module, "CDPSession", return_value=cdp):
+            result = module.read_active_inbox_conversation("刘姗", max_entries=10)
+
+        self.assertEqual(result["rendered_message_count"], 2)
+        self.assertEqual(result["message_type_counts"], {
+            "text_or_card": 1, "image_or_attachment": 1,
+        })
+        calls = [call.args[0] for call in cdp.send.call_args_list]
+        self.assertNotIn("Page.navigate", calls)
+        self.assertFalse(any(method.startswith("Input.") for method in calls))
+
+    def test_active_inbox_script_distinguishes_myself_and_system_rows(self):
+        module = load_module()
+        self.assertIn("item-(?:self|myself)", module.EXTRACT_ACTIVE_INBOX_JS)
+        self.assertIn("item-system", module.EXTRACT_ACTIVE_INBOX_JS)
+
+    def test_active_inbox_send_requires_confirmation_before_opening_cdp(self):
+        module = load_module()
+        with self.assertRaisesRegex(ValueError, "--confirm-send"):
+            module.send_active_inbox_text("杨先生", "你好", confirmed=False)
+
+    def test_active_inbox_send_targets_current_header_and_verifies_once(self):
+        module = load_module()
+        cdp = mock.Mock()
+
+        def send(method, params=None, sid=None, timeout=30):
+            if method == "Target.getTargets":
+                return {"result": {"targetInfos": [{
+                    "targetId": "chat-target", "type": "page",
+                    "url": "https://www.zhipin.com/web/geek/chat",
+                }]}}
+            if method == "Target.attachToTarget":
+                return {"result": {"sessionId": "chat-session"}}
+            if method == "DOM.getDocument":
+                return {"result": {"root": {"nodeId": 1}}}
+            if method == "DOM.querySelector":
+                return {"result": {"nodeId": 2}}
+            return {"result": {}}
+
+        cdp.send.side_effect = send
+        cdp.eval_js.side_effect = [
+            json.dumps({"matches": [{"text": "杨先生｜Loopit", "top": 20, "left": 600}]}),
+            0,
+            1,
+        ]
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(module.time, "sleep"):
+            result = module.send_active_inbox_text("杨先生", "你好", confirmed=True)
+
+        self.assertTrue(result["submitted"])
+        self.assertTrue(result["post_send_visible"])
+        cdp.send.assert_any_call("DOM.focus", {"nodeId": 2}, "chat-session")
+        cdp.send.assert_any_call("Input.insertText", {"text": "你好"}, "chat-session")
+        key_calls = [call for call in cdp.send.call_args_list if call.args[0] == "Input.dispatchKeyEvent"]
+        self.assertEqual(len(key_calls), 2)
+        self.assertFalse(any(call.args[0] == "Page.navigate" for call in cdp.send.call_args_list))
+
+    def test_inbox_discovery_url_must_stay_on_zhipin(self):
+        module = load_module()
+        with self.assertRaises(ValueError):
+            module.discover_inbox_endpoints("https://example.com/", capture_seconds=5)
+
+    def test_inbox_normalizer_returns_progress_metadata_without_message_content(self):
+        module = load_module()
+        conversations = module.normalize_inbox_conversations({
+            "code": 0,
+            "zpData": {"result": [{
+                "encryptUid": "conversation-1",
+                "encryptJobId": "job-1",
+                "securityId": "security-1",
+                "sourceTitle": "大模型算法实习生",
+                "brandName": "示例公司",
+                "title": "算法负责人",
+                "chatStatus": "已沟通",
+                "unreadMsgCount": 2,
+                "lastTime": "刚刚",
+                "lastTS": 123456789,
+                "lastMsg": "这是一条私聊正文，不应输出",
+                "lastMessageInfo": {"content": "私聊预览，不应输出"},
+                "name": "招聘者姓名，不应输出",
+            }]},
+        })
+        rendered = json.dumps(conversations, ensure_ascii=False)
+        self.assertEqual(conversations[0]["company"], "示例公司")
+        self.assertEqual(conversations[0]["unread_count"], 2)
+        self.assertIn("securityId=security-1", conversations[0]["job_link"])
+        self.assertNotIn("私聊正文", rendered)
+        self.assertNotIn("私聊预览", rendered)
+        self.assertNotIn("招聘者姓名", rendered)
+
+    def test_homepage_url_must_stay_on_zhipin(self):
+        module = load_module()
+        with self.assertRaises(ValueError):
+            module.scrape_homepage("https://example.com/", "-", capture_seconds=5)
+
+    def test_atomic_json_write_replaces_target(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = paths["cdp_profile"] / "result.json"
+            module.write_json_atomic(str(target), {"jobs": [{"job_id": "one"}]})
+            module.write_json_atomic(str(target), {"jobs": [{"job_id": "two"}]})
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["jobs"][0]["job_id"], "two")
+            self.assertFalse(any(target.parent.glob(".boss-json-*.tmp")))
 
 
 class ProjectScopeTests(unittest.TestCase):
