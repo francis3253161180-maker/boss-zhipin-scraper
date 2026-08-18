@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a self-contained `skills/boss-tool/` Codex skill package (Chinese command manual + `boss.ps1` + core scripts + city codes) so others can install the tool into local Codex with the skill installer (`--repo francis3253161180-maker/boss-zhipin-scraper --ref master --path skills/boss-tool`). Add `scripts/sync-skill.ps1` to keep the package in sync with the repo root code.
 - Remove the `--mode inbox` CLI mode. `--mode read --list` now supersedes it with a superset of sidebar fields (company, linked job, read/delivered status, last-message sender and read state, text, time, unread count), so the inbox-progress mode and its `scrape_inbox` / `normalize_inbox_conversations` helpers are deleted. `inbox-discover`, `inbox-read-active`, and `inbox-send-active` remain unchanged.
 
 - Remove the `--job_id` CLI selector. `--job_link` (a complete URL with `lid`/`securityId`) is now the only job-selection parameter in `detail` mode. Piped lists still grab every job in the list; auto-loaded lists now error out without `--job_link` to avoid bulk scraping. The `--job_id` argument and `filter_jobs_by_ids` are deleted. The `job_id` data field remains in outputs as the encrypted job ID (derived from the link) for dedup and matching.

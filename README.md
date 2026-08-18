@@ -71,6 +71,18 @@ python3 scripts/job_summary.py
 
 抓完直接拿到：薪资分布、经验要求、高频技能词、求职材料优化提示词。提示词只基于岗位数据，不读取本地简历文件，也不给岗位算个人匹配分。
 
+## 安装为 Codex Skill（可选）
+
+仓库内 `skills/boss-tool/` 是自包含的 Codex 技能包（中文命令手册 + `boss.ps1` + 核心脚本 + 城市码表），可一键安装到本地 Codex：
+
+```powershell
+# 在 Codex 中让代理执行 skill-installer，或直接运行：
+python "<Codex 安装目录>\skills\.system\skill-installer\scripts\install-skill-from-github.py" `
+  --repo francis3253161180-maker/boss-zhipin-scraper --ref master --path skills/boss-tool
+```
+
+安装后技能位于 `~/.codex/skills/boss-tool/`，重启 Codex 生效；技能包自带 `boss.ps1`、`scripts/`、`data/`，无需另外 clone 仓库。作者更新仓库后用 `scripts/sync-skill.ps1` 保持技能包与根目录代码一致。
+
 ## ✨ 特性
 
 - 明文薪资（API 模式，绕过字体反爬）

@@ -69,6 +69,18 @@ python3 scripts/job_summary.py
 
 Right after scraping you get: salary ranges, experience requirements, top skill keywords, and a job-application optimization prompt. The prompt is based solely on the scraped job data — it never reads your local résumé file and never scores personal-job match.
 
+## Install as a Codex Skill (optional)
+
+The `skills/boss-tool/` folder is a self-contained Codex skill package (Chinese command manual + `boss.ps1` + core scripts + city codes). Install it into local Codex with the skill installer:
+
+```powershell
+# Ask Codex to run the skill-installer, or run directly:
+python "<Codex install dir>\skills\.system\skill-installer\scripts\install-skill-from-github.py" `
+  --repo francis3253161180-maker/boss-zhipin-scraper --ref master --path skills/boss-tool
+```
+
+After install the skill lives at `~/.codex/skills/boss-tool/` and takes effect after restarting Codex; it bundles `boss.ps1`, `scripts/`, and `data/`, so no separate repo clone is needed. Maintainers run `scripts/sync-skill.ps1` to keep the package in sync with the repo root code.
+
 ## ✨ Features
 
 - Plaintext salary (API mode, bypasses font-based obfuscation)
