@@ -1,13 +1,13 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.2（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.11（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
-![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.2.0-orange.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
+![Version](https://img.shields.io/badge/version-2.11.0-orange.svg)
 
-一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
+一个面向个人求职研究的低频职位工具：通过 Chrome DevTools Protocol 连接隔离的已登录 Chrome，导航到目标搜索页并捕获页面自身的 `joblist.json` 响应，输出含**明文薪资**的职位数据（JSON / CSV）。详情页串行抓取并支持流式 NDJSON 输出。
 
 > 📌 **一句话介绍**：不用 Selenium/Playwright，直接通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调搜索 API，输出含明文薪资的 JSON/CSV，并生成薪资分布、技能词频和求职材料优化提示词。
 
@@ -32,8 +32,36 @@ pip install -r requirements.txt          # 或 uv sync
 # 2. 启动隔离 Chrome 并登录（只需一次，登录态持久保存）
 python3 scripts/boss_cdp_raw.py --setup-chrome
 
-# 3. 抓取 + 分析
-python3 scripts/boss_cdp_raw.py --keyword "AI Agent" --city 上海 --pages 3 --analysis
+# 3. 搜索岗位列表
+python3 scripts/boss_cdp_raw.py --mode search --keyword "AI Agent" --city 上海 --pages 3 --stdout
+
+# 可选：读取首页个性化推荐与最新职位
+python3 scripts/boss_cdp_raw.py --mode homepage --homepage-url "https://www.zhipin.com/chengdu/?ka=header-home" --stdout
+
+# 可选：读取收件箱沟通进度（不含消息预览和正文）
+python3 scripts/boss_cdp_raw.py --mode inbox --stdout
+
+# 可选：仅发现收件箱 JSON/WebSocket 协议字段结构（不输出任何会话内容）
+python3 scripts/boss_cdp_raw.py --mode inbox-discover --stdout
+
+# 显式读取专用 Chrome 当前已打开的一个会话（不切换、不滚动、不发送）
+python3 scripts/boss_cdp_raw.py --mode inbox-read-active --expect-contact "刘姗" --stdout
+
+# 仅在该次已明确确认的前提下，向当前已打开会话发送一条精确文本
+python3 scripts/boss_cdp_raw.py --mode inbox-send-active --expect-contact "杨先生" --message "你好" --confirm-send --stdout
+
+# 批量投递：打开 JD → 点击 立即沟通/继续沟通 → 自动发送 --content（发送后自动回读校验并返回 send_success）
+python3 scripts/boss_cdp_raw.py --mode send --content "您好，我对该岗位很感兴趣，这是我的简历..." --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout
+# 读取 JD 对应会话的当前聊天历史（区分 对方/自己 发送；只读不发送，必须 --stdout）
+python3 scripts/boss_cdp_raw.py --mode read --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout
+# 列出消息页侧边栏所有会话（名称/公司/job_link/已读或送达/最后消息发送者与已读状态/头像/未读数等完整字段）
+python3 scripts/boss_cdp_raw.py --mode read --list --stdout
+# 读取当前已打开消息页面的选中会话（不切换、不重新打开）
+python3 scripts/boss_cdp_raw.py --mode read --chat --stdout
+# 消息页已打开时优先在侧边栏直接切换会话再读取；切换失败回退打开 job_link 进入
+python3 scripts/boss_cdp_raw.py --mode read --chat --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout
+# 在已打开的消息页直接点击侧边栏会话序号切换并读取（无需重新打开 job_link）
+python3 scripts/boss_cdp_raw.py --mode read --chat --switch-index 0,1 --stdout
 
 # 支持全国城市（含三四五线），例如：
 python3 scripts/boss_cdp_raw.py --keyword "前端" --city 赣州 --pages 3
@@ -49,6 +77,12 @@ python3 scripts/job_summary.py
 ## ✨ 特性
 
 - 明文薪资（API 模式，绕过字体反爬）
+- 首页个性化推荐与最新职位的原生响应捕获（`--mode homepage`）
+- 收件箱沟通进度读取：公司、关联岗位、未读数、最后活动时间（不读取聊天正文）；`inbox-discover` 可额外汇总 JSON/WebSocket 信封字段结构
+- 指定当前会话只读：`inbox-read-active` 在主消息区标题校验联系人后，仅提取页面已渲染的逻辑消息行及消息类型；不读取其它会话、不加载更早历史、不发送
+- 单次确认发送：`inbox-send-active` 必须同时提供当前会话联系人、精确文本和 `--confirm-send`；无搜索、无队列、无附件、无自动重试，发送后仅校验该文本是否出现在当前会话
+- 批量投递（`--mode send`）：打开 `--job_link` 指定的 JD → 点击「立即沟通/继续沟通」让 BOSS 自动打开并切换会话 → 发送精确 `--content`；发送后不关闭消息页，立即回读聊天历史最后一条做校验，返回 `send_success`/`verified_last_sender`/`verified_last_text`；串行低频、每岗位只发一次、失败不自动重试，检测到风控立即停止整个批次
+- 会话读取（`--mode read`）多形态：`--list` 合并原生会话列表与侧边栏 DOM，返回每个会话的名称/头像/公司/职位/job_link/已读或送达状态/最后一条消息（发送者 `self`/`other`、已读或送达状态、文本、时间）/未读数/是否置顶/是否选中/侧边栏序号等完整字段；`--chat` 读取当前已打开消息页面的选中会话；`--chat --job_link` 在消息页已打开时**优先点击侧边栏直接切换会话**，切换失败或未打开消息页才回退打开 job_link 进入（结果带 `entered_via: sidebar|job_link`，汇总含 `via_sidebar`/`via_job_link`）；`--chat --switch-index N` 在已打开的消息页用受信任鼠标事件直接点击侧边栏会话切换（无需 job_link 重新打开）。逐条区分 `self`/`other` 及系统/平台卡片/附件；不滚动更早记录、不发送、stdout-only 不落盘
 - Boss 活跃状态独立字段（`boss_active_status`）：列表兼容 `bossOnline`→「在线」，详情可得到「刚刚活跃」等更细状态
 - JSON / CSV 双格式输出
 - 详情页 JD 抓取 + 技能分析
@@ -56,14 +90,27 @@ python3 scripts/job_summary.py
 - 增量写入（异常退出不丢数据）
 - 一键环境检查 + 持久隔离 Chrome CDP profile
 - 多维筛选（规模、融资、薪资、经验、学历、行业）
-- macOS + Linux 支持；Windows 已通过单元测试与基础 CLI 验证（GBK 控制台崩溃已修复），真实抓取链路仍欢迎反馈
+- Windows、macOS、Linux（Windows 工作区请使用 `boss.ps1`）
+
+### 请求路径与输出模式
+
+- 列表搜索使用页面原生网络响应捕获，不再注入第二个同步 XHR，也不在正式搜索前发送固定登录探测。
+- 首页模式捕获页面自身的 `recommend/job/list.json` 响应：`sortType=1` 标记为 `selected`（精选岗位），`sortType=2` 标记为 `latest`（最新职位）。
+- 收件箱模式捕获页面自身的会话列表响应，仅输出公司、关联岗位、未读数、最后活动时间与加密关联标识；招聘者姓名、头像、消息预览和正文均不输出。
+- `--check` 只检查依赖和 CDP，不访问 BOSS；真实目标搜索才是登录态和接口可用性的判断依据。
+- `--stdout` 在完成后输出一个完整 JSON 文档；`--stream-json`（仅 detail）每完成一个岗位输出一行 NDJSON。
+- `--job_link` 直链详情会从渲染页面补齐可见的标题、公司、薪资、地点、标签和公司链接；不存在的字段保持为空。
+- 投递模式（`--mode send`）逐条打开 JD 页面，点击「立即沟通/继续沟通」由 BOSS 自行打开并切换到对应会话，确认 `--content` 已写入输入框后，用受信任的 Enter 序列（rawKeyDown+char+keyUp）发送；发送后**不关闭消息页**，立即回读聊天历史最后一条，若与 `--content` 一致则 `send_success=true`，并附 `verified_last_sender`（self/other）与 `verified_last_text`（回读原文，截断 200 字符）；汇总层额外给出 `sent_verified` 计数。另有 `post_send_visible` 与 `composer_cleared_after_send` 字段；失败只报告、绝不自动重发；开始前有 5 秒预检倒计时可 Ctrl+C 取消，岗位之间 8–15 秒间隔，检测到风控提示立即停止剩余投递。
+- 读取模式（`--mode read`）支持三种形态：`--list` 合并原生会话列表与侧边栏 DOM，返回全部会话的 名称/头像/公司/职位/job_link/已读或送达状态/最后一条消息（`last_message_sender` 区分 `self`/`other`、`last_message_read` 区分 已读/送达/未读、`last_message_text`/`last_message_time`）/未读数/是否置顶/是否选中/侧边栏序号 `index`（可直接用于 `--chat --switch-index`）；`--chat` 只读当前已打开消息页面的选中会话；`--chat --job_link` 消息页已打开时先在侧边栏用受信任鼠标事件切换会话再读取，切换失败或无消息页才回退打开 JD 进入（`entered_via` 标记实际入口，汇总含 `via_sidebar`/`via_job_link`）；`--chat --switch-index 0,1` 在当前消息页直接点击侧边栏会话切换后读取（不通过 job_link 重新打开）。每条消息标注 `sender`（`self`/`other`/`system`/`platform`/`attachment`/`unknown`）；必须配 `--stdout`，不写聊天正文到磁盘，不发送、不自动滚动更早历史，检测到风控立即停止。
+- JSON 增量写盘使用临时文件原子替换，避免中断留下半截结果。
+- 等待采用自适应策略：分页间隔 8–15 秒，详情初始渲染 5–8 秒，仅在缺少“职位描述”时最多补两次短滚动，详情之间 8–15 秒，最后一个岗位不额外等待。
 
 <details>
 <summary>🔍 为什么不选 Selenium / Playwright 类爬虫？</summary>
 
 - Selenium/Playwright 会启动完整的受控浏览器，体积大、指纹明显，容易触发 BOSS 的风控和验证码。
 - 本工具直接连接你已经登录的真实 Chrome（CDP），复用真实指纹和登录态，调用的也是页面内合法的搜索 API，返回的 `salaryDesc` 本就是明文——不需要解析被字体反爬加密的 DOM 薪资。
-- 因此比传统 DOM 抓取类爬虫更稳定，也更难被识别为自动化流量。
+- 因此减少了重复请求和不必要的页面注入，通常比额外发起 XHR 的 DOM 抓取方式更稳定。
 
 </details>
 
@@ -137,7 +184,7 @@ pip install -r requirements.txt
 # 2. 启动 Chrome CDP
 python3 scripts/boss_cdp_raw.py --setup-chrome
 # 首次使用也不会复制主 Chrome 登录态；请在弹出的 BOSS 专用浏览器中登录 zhipin.com
-# setup 会等待登录完成，并确认接口能返回明文薪资
+# setup 只启动专用 Chrome；手动登录后直接运行目标搜索
 
 # 3. 检查环境
 python3 scripts/boss_cdp_raw.py --check
@@ -146,7 +193,7 @@ python3 scripts/boss_cdp_raw.py --check
 python3 scripts/boss_cdp_raw.py --smoke-test
 
 # 4. 抓取
-python3 scripts/boss_cdp_raw.py --keyword "AI Agent" --city 上海 --pages 3 --format csv --analysis
+python3 scripts/boss_cdp_raw.py --mode search --keyword "AI Agent" --city 上海 --pages 3 --format csv
 
 # 5. 抓取后摘要和提示词
 python3 scripts/job_summary.py --top 15
@@ -161,18 +208,26 @@ python3 scripts/job_summary.py --top 15
 | `--list-cities [关键词]` | 打印支持的城市列表，可选关键词过滤，如 `--list-cities 江` |
 | `--pages` | 页数（上限 10） |
 | `--format` | json / csv；csv 会同时导出列表和详情 CSV |
-| `--detail` | 抓取详情页 JD（默认开启） |
-| `--no-detail` | 不抓取详情页 |
-| `--analysis` | 分析报告 |
-| `--merge FILE` | 合并已有数据（按 job_id 去重） |
+| `--mode search/detail/homepage/inbox/send/read` | 列表搜索、精选详情、首页推荐/最新职位、收件箱进度、批量投递或会话读取 |
+| `--content` | `send` 模式要发送的精确文案（必填，最多 500 字符） |
+| `--list` | `read` 模式：列出侧边栏所有会话摘要（名称/公司/job_link/已读或送达/时间） |
+| `--chat` | `read` 模式：读取聊天；无附加参数=读当前选中会话，配 `--job_link`=从 JD 进入，配 `--switch-index`=直切侧边栏会话 |
+| `--switch-index` | `read --chat` 模式：侧边栏会话序号（0 起，逗号分隔），直接点击切换，无需重新打开 job_link |
+| `--expect-contact` | `inbox-read-active` / `read --chat` 的当前会话联系人校验姓名 |
+| `--max-chat-items` | `inbox-read-active` / `read` 最多输出的已渲染消息条数（1–200） |
+| `--homepage-url` | `homepage` 模式目标首页地址 |
+| `--inbox-url` | `inbox` / `inbox-discover` 的目标收件箱地址 |
+| `--capture-seconds` | `homepage` / `inbox` 原生响应捕获窗口，5–30 秒 |
+| `--job_id` | 按列表中的 job_id 选择详情 |
+| `--job_link` | 直接按完整岗位链接选择详情 |
+| `--stdout` | 完成后输出一个完整 JSON 文档 |
+| `--stream-json` | detail 模式每完成一个岗位输出一行 NDJSON |
 | `--allow-dom-fallback` | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
-| `--check` | 环境检查（CDP + 依赖 + 登录态） |
+| `--check` | 本地环境检查（依赖 + CDP，不访问 BOSS） |
 | `--smoke-test` | 用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test，不写结果文件 |
 | `--setup-chrome` | 一键启动 Chrome CDP（持久隔离 profile） |
 | `--copy-login-state` | 手动导入主 Chrome 的 Local State + Cookie 相关文件到隔离 profile（默认、首次启动、重复启动都不复制） |
 | `--reset-chrome-profile` | 重建 BOSS 专用 Chrome profile，会清除此专用浏览器内的登录态 |
-| `--no-wait-login` | `--setup-chrome` 启动后不等待登录完成 |
-| `--login-timeout` | `--setup-chrome` 等待登录完成的秒数（默认 300） |
 | `--stop-chrome` | 关闭 BOSS 专用 CDP Chrome（按隔离 profile 精准匹配，不碰主 Chrome） |
 | `--close-chrome` | 抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态） |
 | `--output` | 列表输出路径（默认 `~/.boss-zhipin-scraper/job-result/`） |
@@ -228,16 +283,17 @@ boss-zhipin-scraper/
 这是一个基于 Chrome CDP 的 BOSS直聘爬虫，核心流程：
 
 1. 通过 Chrome DevTools Protocol (CDP) 连接到已打开的 Chrome
-2. 导航到真实搜索页，通过 CDP `Network` 域**被动捕获页面自身发出的搜索 API 响应**（不发任何注入请求，规避 BOSS 对注入 XHR 的风控识别）
-3. 翻页通过滚动触发页面自身的无限滚动加载，继续旁听其请求；API 返回明文 `salaryDesc`，绕过前端字体反爬
-4. 列表 API 保留 `securityId` / `lid` 等上下文，进入详情页时带上这些参数
-5. 每页抓完立即写入文件，按 `job_id` 去重
+2. 导航到目标搜索页或首页，通过 CDP Network 事件捕获页面自身的职位 JSON 响应
+3. 收件箱读取仅走页面原生会话列表响应；不读取消息正文，也不提供自动发送消息能力。
+3. 原生页面响应包含明文 `salaryDesc`，并保留 `securityId` / `lid` 等上下文
+4. 详情页串行打开并从渲染页面提取 JD 和直链模式缺失的可见字段
+5. 每条完成数据原子写入文件，按 `job_id` 去重
 
 默认不会使用 DOM 提取列表，因为 DOM 薪资可能受字体反爬影响。只有明确传 `--allow-dom-fallback` 时，API 无数据才会降级 DOM。
 
 详情页只从包含“职位描述”的详情区提取 JD，整页 `body` 仅用于识别登录墙和导航页，不会直接写入结果。若页面出现“登录查看完整内容”，抓取会明确报错并停止，避免把截断正文、招聘者信息、公司介绍和推荐职位当成完整 JD 保存。
 
-`--input ... --analysis --no-detail` 会优先加载 `--detail-output`，其次加载与输入列表同目录、同时间戳的 `boss_details_*.json`，最后查找 `~/.boss-zhipin-scraper/job-result` 下最新详情文件。
+列表到详情可以通过 `--job_id` 自动加载最新列表、通过 PowerShell 管道传入列表，或直接使用带 `lid/securityId` 的 `--job_link`。
 
 ## Chrome profile 安全策略
 
@@ -249,9 +305,9 @@ boss-zhipin-scraper/
 
 - `~/.boss-zhipin-scraper/job-result`
 
-首次使用需要在这个专用 Chrome 中手动登录 BOSS直聘。`--setup-chrome` 会等待登录完成，并用搜索接口确认能拿到明文 `salaryDesc` 后再返回。登录态保存在专用 profile 内，重启机器后仍然保留；重复运行 `--setup-chrome` 不会清空它，也不会影响主 Chrome、Gmail、GitHub 等账号。
+首次使用需要在这个专用 Chrome 中手动登录 BOSS直聘。使用 `--setup-chrome` 启动后手动登录，再直接运行目标搜索；程序不会发送固定登录探测请求，登录态保存在专用 profile 内，重启机器后仍然保留。
 
-登录探测不向页面注入任何请求：`--setup-chrome` 等待登录时会在不同关键词/城市之间轮换导航真实搜索页，被动捕获页面自身发出的搜索响应，等待间隔从 3 秒逐步退避到最多 15 秒；这些页面请求同样计入单次 500 次的全局请求预算。正式抓取不再单独发送固定关键词的探测请求，登录/风控判定直接用第一次真实搜索的响应完成。未登录、探测样本为空、接口限制和响应异常会分别提示。遇到已确认的限制状态（例如 `code: 31`、`code: 37`「您的环境存在异常」）会立即停止探测，不会继续提示重复登录或密集重试；对未知风控码还会按 message 关键字（环境存在异常、访问频繁、安全校验等）兜底识别为限制状态，避免把「已登录但被风控」误判为登录失败。
+`--check` 不再发送 BOSS 搜索请求；真实目标搜索的页面原生响应同时承担登录态、风控和数据可用性判断。遇到 `code: 31` 或 `code: 37` 会立即停止，不要重复检查或重试。
 
 `--setup-chrome` 的交互式登录页是唯一会主动置前的临时页面；环境检查、列表/详情抓取和 smoke test 创建的临时标签页都会在后台运行，避免自动流程反复抢占当前窗口。这里的“后台”仅表示不激活标签页，专用 Chrome 仍以有界面模式运行，必要时可以手动打开检查。
 
@@ -299,4 +355,4 @@ MIT
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/chart?repos=eatmoreduck/boss-zhipin-scraper&type=date&legend=top-left&sealed_token=linAWksW9v7s0YEw83L89xbRzD4QWaJWxKrQHvkJBmx9xwMH8PseUKUQC9QAcRYaBFK1jBA_Mod4Vs8qH9A47spODANKwiVWieL3CxxQ3f9ZLqHYRwzTiA)](https://www.star-history.com/?type=date&repos=eatmoreduck%2Fboss-zhipin-scraper)
+[![Star History Chart](https://api.star-history.com/svg?repos=eatmoreduck/boss-zhipin-scraper&type=Date)](https://star-history.com/#eatmoreduck/boss-zhipin-scraper&Date)

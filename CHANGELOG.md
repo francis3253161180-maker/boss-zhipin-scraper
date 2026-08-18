@@ -1,14 +1,28 @@
 # Changelog
 
-## 未发布
+## Unreleased
 
-### 变更
-- 新增 Issue 标签约定（#58）：`CONTRIBUTING.md` 增加标签语义表与打标原则（`wontfix`/`invalid` 关闭须留理由），`AGENTS.md` 补 issue 分诊打标指引；开放 issue 已完成首轮打标
-- 文档同步被动捕获架构（#56）：`AGENTS.md` 重写架构关键点（列表=Network 被动捕获、焦点仿真进 CDP 不变量、BOSS 页面行为事实），新增两条硬规则（动抓取链路必须真机 e2e；合规红线：只被动捕获、禁止指纹伪造/验证码绕过/代理轮换），补合并惯例与 spike 脚本约定；README 双语登录探测段落同步为被动捕获表述
-- 列表抓取与登录探测全面改为**被动捕获**（#53/#30）：不再向页面注入同步 XHR（该请求模式会被 BOSS 风控识别为 code 37），改为导航真实搜索页后通过 CDP `Network` 域旁听页面自身发出的 `joblist.json` 响应；翻页改为滚动触发页面自身的无限滚动加载（每页 15 条，`hasMore=false` 时提前结束）。字段映射逻辑从注入 JS 模板迁至 Python（`map_api_job`）
-- 登录/风控判定并入首次真实搜索响应（`LoginGateError`）：正式抓取不再预先发送固定 `Java/上海` 登录探测，消除一次无关请求；`--check`、`--setup-chrome` 的探测同样改为被动捕获，消息与退出语义不变
-- 后台标签页开启 `Emulation.setFocusEmulationEnabled` 焦点仿真：页面自身的无限滚动加载在真实后台（不可见、无焦点）状态下不触发，仿真后 `document.hidden=false / visibilityState=visible / hasFocus=true`，且不激活窗口、不抢前台焦点
-- 删除死代码：`FETCH_API_JS_TEMPLATE`、`build_login_probe_url`、`parse_api_jobs_eval_value`、`should_use_dom_fallback`；`CDPSession` 新增事件缓冲与 `drain_events`；测试从 92 增至 96 个
+- Add `--mode read`: opens each `--job_link` JD in the dedicated Chrome, clicks `立即沟通`/`继续沟通` so BOSS opens and switches to the conversation, then reads only the currently rendered chat history with per-message sender direction (`self` for own text, `other` for the recruiter, plus `system`/`platform`/`attachment`/`unknown` for non-text rows). Read-only: never types or sends, does not scroll older history, and is stdout-only so private chat bodies are not written to disk. Serial 3-6s pacing; per-job failures are skipped; risk-control markers abort the whole batch.
+- Add `--mode send` batch delivery: opens each `--job_link` JD in the dedicated Chrome, clicks `立即沟通`/`继续沟通` so BOSS opens and switches to the conversation, verifies the rendered composer contains `--content`, then sends it with a trusted Enter sequence (rawKeyDown + char + keyUp). Serial with 8-15s pacing, one send per job, and an immediate whole-batch abort on risk-control markers. After sending it keeps the chat page open and reads back the last rendered history row: `send_success=true` when it matches `--content`, plus `verified_last_sender` (self/other) and `verified_last_text` (raw read-back, truncated to 200 chars); the batch summary reports `sent_verified`. Existing `post_send_visible` (outgoing count confirmed by a bounded ≤6s poll) and `composer_cleared_after_send` remain; a failed confirmation is reported but never triggers a resend. A 5-second pre-flight countdown with Ctrl+C precedes the first send.
+- Add `--mode read` sidebar and current-chat forms: `--list` merges the native conversation-list response with the rendered sidebar to return every conversation's name, company, linked `job_link`, read/delivered status, and last-message time, exposing a 0-based `index` for direct switching; `--chat` reads only the currently selected conversation on the already open chat page; `--chat --job_link` opens the JD and reads that conversation; `--chat --switch-index 0,1` clicks sidebar rows directly with trusted mouse events (BOSS's SPA ignores `element.click()`) so conversations can be switched without reopening a job_link. Every row keeps the `sender` direction (`self`/`other`/`system`/`platform`/`attachment`/`unknown`); all read forms are read-only, stdout-only, and do not scroll older history.
+- Extend `--mode read --list` to full sidebar structure: it now captures the raw `getGeekFriendList.json` items (`wait_for_native_inbox_list` gains `normalized=False`) and merges them with the rendered rows, returning per-conversation `recruiter_avatar`, `selected`, `last_message_sender` (`self`/`other` derived from `lastMessageInfo.fromId` vs `uid`), `last_message_read` (已读/送达/未读 from native `status` 2/1/0), `last_message_text`, `last_message_time`, `unread_count`, `is_top`, `chat_status`, `relation_type`, plus the existing name/company/job_link/index fields. Filtered (non-rendered) conversations are excluded and rows are ordered by sidebar `index`.
+- Prefer switching on the open chat page in `--mode read --chat --job_link`: instead of always opening the JD, it now locates the job in the open chat page's sidebar (native items are captured from a fresh hidden target so the user's page is never reloaded or disrupted), clicks the row with trusted mouse events, and reads the history; on any attach/match/click failure or when no chat page is open it falls back to opening the job_link. Each result reports `entered_via` (`sidebar`/`job_link`) and the summary adds `via_sidebar`/`via_job_link` counts. `attach_active_inbox_target` tolerates multiple open chat pages (uses the first) and side-car chat pages are closed.
+- Fix post-send confirmation: BOSS prefixes delivered outgoing rows with timestamps (`12:45 送达 `), so `COUNT_ACTIVE_OUTGOING_TEXT_JS` now strips the prefix and uses a contains match; this fixes `post_send_visible` always reporting `false`.
+- Add `inbox-send-active`, a current-conversation-only single text sender requiring a named header match, exact text, and `--confirm-send`. It has no recipient search, batch queue, attachment, status action, scheduling, or automatic retry; post-send verification checks the outgoing text count once.
+- Correct active-chat logical message classification for BOSS `item-myself` and `item-system` rows, reporting outgoing text and system events separately from incoming text.
+- Harden `inbox-read-active` contact verification: the expected name must occur in the main conversation header, not merely in the left contact list. Abort before reading if the active header does not match.
+- Add `inbox-read-active`: an explicit, named-contact verified, current-view-only conversation reader. It attaches to an already open dedicated Chrome chat page and extracts logical rendered message rows/types without navigating, clicking, scrolling, writing a chat transcript to disk, or sending.
+- Extend read-only `inbox-discover` with WebSocket envelope/schema summaries. It reports protocol keys and frame direction only, never chat body values, attachment URLs, recruiter names, or opaque identifiers embedded in frames.
+- Add `--mode homepage` to capture the homepage's native personalized/latest-job responses without controlling the user's main browser; map `sortType=1/2` to `selected/latest`, retain response provenance, and deduplicate the flattened job list.
+- Add privacy-minimizing `--mode inbox` and `inbox-discover`: native conversation-list monitoring can return company/job/unread/last-activity metadata while excluding recruiter names, previews, and message bodies. Automatic message sending is intentionally out of scope.
+- Capture native BOSS list-page network responses instead of injecting a second synchronous XHR.
+- Make `--check` local-only and remove automatic login-probe requests from setup.
+- Remove injected page scripts and synthetic mouse events from the normal CDP path.
+- Add direct-link detail metadata fallback, visible internship-constraint tags, and detail `--stream-json` NDJSON output.
+- Make JSON writes atomic and keep Windows PowerShell/subprocess handling stable.
+- Reduce unnecessary waiting: remove list-page scrolling, use 8–15s page/detail gaps, and retry detail scrolling only when the JD section is not yet available.
+
+## 未发布
 
 ### 新增
 - 详情/列表结果新增独立字段 `boss_active_status`（如「今日活跃」「在线」）：列表兼容 `activeTimeDesc` 与 `bossOnline`（仅在线时映射为「在线」）；详情页从招聘者卡片解析更细粒度状态并优先保留；JD 正文仍剔除该行，不混入描述
@@ -16,11 +30,6 @@
 - 城市码表外置为 `data/city_codes.json`（全量 300+ 城市，覆盖一二三四五线），新增 `--list-cities [关键词]` 命令查看支持的城市；`resolve_city` 查询链改为「本地静态码表 → 运行时拉 BOSS 接口 → 9 位裸码兜底」。城市码表打进 wheel，`pip install` 用户也可用。（#24）
 
 ### 修复
-- Windows 兼容：`main()` 入口将 stdout/stderr 重配为 UTF-8，修复 Windows GBK 控制台遇到 emoji（✅❌⚠️ 等）输出直接 `UnicodeEncodeError` 崩溃的问题（实测此前 73 个单测中 8 个因此失败）
-- JSON 落盘改为原子写入（临时文件 + `os.replace`）：进程中断不再留下半截 JSON 覆盖旧数据；`flush_jobs`、详情页写入与 `--merge` 详情落盘统一走 `_atomic_write_json`
-- `--check` 的 CDP 连通检查不再把任意 CDP 服务误报为「Chrome」，改为输出实际服务标识
-- 清理死代码与重复实现：删除无调用方的 `append_json`；`flush_jobs`/`merge_jobs`/`merge_details_from_lists` 的读-去重-写收敛到 `merge_unique`；`parse_jobs_eval_value` 与 `parse_api_jobs_eval_value` 合并（smoke test 改用后者，行为不变）
-- 测试平台适配：Chrome 进程查询的 mock 输出改为按平台生成（Windows 分支解析 PowerShell JSON、POSIX 分支解析 ps 文本），修复 Windows 上 3 个既有测试失败；`test_help_does_not_require_cdp_runtime_dependencies` 显式指定 UTF-8 解码；新增 `merge_unique` / `_atomic_write_json` / `flush_jobs` 单元测试（全量 92 个测试通过）
 - 城市解析先执行本地及在线码表的正反向映射，再接受未收录的 9 位裸城市码；未知城市名现在会在抓取前明确报错退出。在线城市接口同时校验业务 `code`，不再把 `code: 35` 等风控响应静默当作空码表
 - 登录探测识别 BOSS 风控码 `code: 37`「您的环境存在异常」为限制状态（RESTRICTED），并对未知风控码按 message 关键字（环境存在异常、访问频繁、安全校验等）兜底识别；避免已登录但被风控/限流的用户被误判为「登录探测响应异常」而无法继续。（#33）
 - 登录探测改为区分可用、未登录、限制、空结果和响应异常；每轮仅请求一次并采用有上限的退避等待，`code: 31` 等明确限制会立即停止。探测请求现已纳入全局请求预算，CLI 不再把风控或异常统一提示为未登录。（#31）
@@ -34,7 +43,6 @@
 - API URL filter 改用 `urlencode`（原字符串拼接，filter 值含特殊字符会出错）
 
 ### 变更
-- 平台支持声明更新：Windows 已通过单元测试与基础 CLI 验证（GBK 控制台崩溃等已修复），README 中英双语同步调整（此前 v2.0.0 撤回的"未经实测"声明在本修复后更新）
 - 平台支持声明改为 macOS + Linux（Windows 代码分支保留但未经实测，不再声称支持，避免过度承诺）
 - `pyproject.toml` 删除空的 `[csv]` extra（csv 是标准库）
 - SKILL.md 脚本路径解析改用 Python `os.path.realpath`（macOS 自带 `readlink` 无 `-f`）

@@ -30,6 +30,8 @@ htmlcov/
 
 # Project-generated local files
 docs/
+job-data/
+boss-chrome-proxy.pac
 
 # Local skill tooling config (baoyu-image-gen etc.)
 .baoyu-skills/
