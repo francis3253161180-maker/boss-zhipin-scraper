@@ -76,8 +76,8 @@ python3 scripts/job_summary.py
 仓库内 `skills/boss-tool/` 是自包含的 Codex 技能包（中文命令手册 + `boss.ps1` + 核心脚本 + 城市码表），可一键安装到本地 Codex：
 
 ```powershell
-# 在 Codex 中让代理执行 skill-installer，或直接运行：
-python "<Codex 安装目录>\skills\.system\skill-installer\scripts\install-skill-from-github.py" `
+# 在 Codex 中让代理执行 skill-installer，或直接运行（~ 自动展开为用户目录，勿加引号）：
+python ~\.codex\skills\.system\skill-installer\scripts\install-skill-from-github.py `
   --repo francis3253161180-maker/boss-zhipin-scraper --ref master --path skills/boss-tool
 ```
 

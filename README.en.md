@@ -74,8 +74,8 @@ Right after scraping you get: salary ranges, experience requirements, top skill 
 The `skills/boss-tool/` folder is a self-contained Codex skill package (Chinese command manual + `boss.ps1` + core scripts + city codes). Install it into local Codex with the skill installer:
 
 ```powershell
-# Ask Codex to run the skill-installer, or run directly:
-python "<Codex install dir>\skills\.system\skill-installer\scripts\install-skill-from-github.py" `
+# Ask Codex to run the skill-installer, or run directly (~ expands to your home dir; do not quote it):
+python ~\.codex\skills\.system\skill-installer\scripts\install-skill-from-github.py `
   --repo francis3253161180-maker/boss-zhipin-scraper --ref master --path skills/boss-tool
 ```
 
