@@ -60,9 +60,9 @@ Timing policy: wait 8–15 seconds between search pages; wait 5–8 seconds afte
 .\boss-zhipin-scraper\boss.ps1 --mode read --chat --stdout
 .\boss-zhipin-scraper\boss.ps1 --mode read --chat --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=...&securityId=..." --stdout
 .\boss-zhipin-scraper\boss.ps1 --mode read --chat --switch-index 0,1 --stdout
-.\boss-zhipin-scraper\boss.ps1 --mode detail --job_id id1,id2 --detail-output .\job-data\details.json
+.\boss-zhipin-scraper\boss.ps1 --mode detail --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=...&securityId=..." --detail-output .\job-data\details.json
 .\boss-zhipin-scraper\boss.ps1 --mode detail --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=...&securityId=..." --stdout
-.\boss-zhipin-scraper\boss.ps1 --mode detail --job_id id1,id2 --stream-json
+.\boss-zhipin-scraper\boss.ps1 --mode detail --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=...&securityId=..." --stream-json
 ```
 
 When installing this skill into a local skills tree, package the summary helper as well:

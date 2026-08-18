@@ -214,8 +214,7 @@ python3 scripts/job_summary.py --top 15
 | `--homepage-url` | Target homepage URL for `homepage` mode |
 | `--inbox-url` | Target inbox URL for `inbox` / `inbox-discover` mode |
 | `--capture-seconds` | Native homepage/inbox-response window, 5–30 seconds |
-| `--job_id` | Select details by IDs from a list |
-| `--job_link` | Fetch details directly from complete links |
+| `--job_link` | Fetch details directly from complete links (the only job-selection parameter, includes `lid`/`securityId`) |
 | `--stdout` | Emit one final JSON document |
 | `--stream-json` | Detail-only NDJSON, one completed job per line |
 | `--allow-dom-fallback` | Allow DOM extraction fallback when the API has no data; off by default, salaries may be unreliable |
@@ -290,7 +289,7 @@ DOM extraction is not used for the list by default, since DOM salaries may be hi
 
 For detail pages, the scraper only extracts a section containing the job-description heading. Full-page `body` text is diagnostic input for detecting login walls and navigation shells and is never written directly as a JD. If the page contains the login-to-view-full-content marker, the crawl fails explicitly and stops before truncated text, recruiter metadata, company sections, or recommended jobs can be saved as a complete JD.
 
-List-to-detail runs can use `--job_id` with the newest list, a PowerShell pipeline, or a complete `--job_link` containing `lid` and `securityId`.
+List-to-detail runs use a PowerShell pipeline (fetches every job in the piped list) or a complete `--job_link` containing `lid`/`securityId` to select individual jobs. `--job_link` is now the only job-selection parameter, replacing `--job_id`.
 
 ## Chrome Profile Security Policy
 

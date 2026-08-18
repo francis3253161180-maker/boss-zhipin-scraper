@@ -218,8 +218,7 @@ python3 scripts/job_summary.py --top 15
 | `--homepage-url` | `homepage` 模式目标首页地址 |
 | `--inbox-url` | `inbox` / `inbox-discover` 的目标收件箱地址 |
 | `--capture-seconds` | `homepage` / `inbox` 原生响应捕获窗口，5–30 秒 |
-| `--job_id` | 按列表中的 job_id 选择详情 |
-| `--job_link` | 直接按完整岗位链接选择详情 |
+| `--job_link` | 按完整岗位链接选择详情（唯一岗位选择参数，含 lid/securityId） |
 | `--stdout` | 完成后输出一个完整 JSON 文档 |
 | `--stream-json` | detail 模式每完成一个岗位输出一行 NDJSON |
 | `--allow-dom-fallback` | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
@@ -293,7 +292,7 @@ boss-zhipin-scraper/
 
 详情页只从包含“职位描述”的详情区提取 JD，整页 `body` 仅用于识别登录墙和导航页，不会直接写入结果。若页面出现“登录查看完整内容”，抓取会明确报错并停止，避免把截断正文、招聘者信息、公司介绍和推荐职位当成完整 JD 保存。
 
-列表到详情可以通过 `--job_id` 自动加载最新列表、通过 PowerShell 管道传入列表，或直接使用带 `lid/securityId` 的 `--job_link`。
+列表到详情：通过 PowerShell 管道传入列表（对列表内全部岗位抓详情），或直接用带 `lid/securityId` 的 `--job_link` 精选单个/多个岗位。`--job_link` 是唯一岗位选择参数，已取代 `--job_id`。
 
 ## Chrome profile 安全策略
 

@@ -13,7 +13,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   # 阶段1 检索列表（多条件筛选）
   uv run python3 scripts/boss_cdp_raw.py --mode search --keyword "agent开发" --city 北京 --pages 3 --scale 305 --salary 406 --stdout
   # 阶段2 精选详情（管道 / 自动加载最新列表 / --job_link 直接传链接）
-  uv run python3 scripts/boss_cdp_raw.py --mode detail --job_id id1,id2 --stdout
+  uv run python3 scripts/boss_cdp_raw.py --mode detail --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout
   uv run python3 scripts/boss_cdp_raw.py --check
   uv run python3 scripts/boss_cdp_raw.py --setup-chrome
   uv run python3 scripts/boss_cdp_raw.py --version
@@ -4277,19 +4277,6 @@ def job_id_from_link(link):
         return ""
 
 
-def filter_jobs_by_ids(list_data, detail_ids):
-    """按 job_id 过滤列表，返回 (筛选后的岗位列表, 未匹配的 id 集合)"""
-    if isinstance(detail_ids, str):
-        wanted = {s.strip() for s in detail_ids.split(",") if s.strip()}
-    else:
-        wanted = {str(s).strip() for s in detail_ids if str(s).strip()}
-    detail_jobs = [
-        j for j in list_data.get("jobs", [])
-        if str(j.get("job_id", "")) in wanted
-    ]
-    missing = wanted - {str(j.get("job_id", "")) for j in detail_jobs}
-    return detail_jobs, missing
-
 def main():
     p = argparse.ArgumentParser(
         description=f"BOSS直聘抓取 + 分析 (CDP Raw) v{__version__}",
@@ -4310,8 +4297,8 @@ def main():
   %(prog)s --mode search --keyword "agent开发" --city 北京 --pages 3 --stdout
   %(prog)s --mode search --keyword "agent开发" --city 北京 --pages 3 --scale 305 --salary 406
 
-  # 阶段2 精选详情（管道喂列表 / 指定文件 / 自动加载最新列表）
-  %(prog)s --mode detail --job_id id1,id2 --stdout
+  # 阶段2 精选详情（--job_link 直选 / 管道喂精选列表）
+  %(prog)s --mode detail --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout
 
   # 首页个性化推荐与最新职位（捕获页面原生响应）
   %(prog)s --mode homepage --homepage-url "https://www.zhipin.com/chengdu/?ka=header-home" --stdout
@@ -4395,10 +4382,8 @@ def main():
 
     # 功能开关
     p.add_argument("--max-details", type=int, default=None, help="detail 模式最多抓几个详情")
-    p.add_argument("--job_id", dest="job_ids", default=None,
-                   help="按 job_id 精选详情（逗号分隔；需列表来源：管道/自动加载最新）")
     p.add_argument("--job_link", dest="job_links", default=None,
-                   help="按完整 job_link 精选详情 / send 投递 / read 读取目标（逗号分隔；含 lid/securityId，无需列表文件）")
+                   help="按完整 job_link 精选详情 / send 投递 / read 读取目标（逗号分隔；含 lid/securityId，无需列表文件；唯一岗位选择参数，已取代 --job_id）")
     p.add_argument("--mode", choices=["search", "detail", "homepage", "inbox", "inbox-discover", "inbox-read-active", "inbox-send-active", "send", "read"], default="search",
                    help="功能模式：search=多条件检索；detail=精选详情；homepage=首页推荐/最新职位；inbox=收件箱进度；inbox-discover=只读发现接口；inbox-read-active=读取当前已选会话；inbox-send-active=单次确认发送；send=打开 JD → 点击立即沟通/继续沟通 → 发送 --content；read=读取聊天（--list 列会话 / --chat 读当前选中会话 / --chat --job_link 从 JD 进入 / --chat --switch-index 直切侧边栏会话）")
     p.add_argument("--stdout", action="store_true",
@@ -4633,9 +4618,8 @@ def main():
         sys.exit(0)
 
 
-    # --mode detail: 列表来源 = 管道stdin / 自动加载最新 / --job_link 直接传链接
+    # --mode detail: 列表来源 = --job_link 直选（唯一岗位选择参数） / 管道 stdin 全量
     if args.mode == "detail":
-        id_tokens = [t.strip() for t in (args.job_ids or "").split(",") if t.strip()]
         link_tokens = [t.strip() for t in (args.job_links or "").split(",") if t.strip()]
 
         link_jobs = []
@@ -4651,36 +4635,20 @@ def main():
                     "job_link": t,
                 })
             print(f"按 job_link 直接加载 {len(link_jobs)} 条（无需列表文件）")
-
-        need_list = bool(id_tokens) or not (link_tokens or id_tokens)
-        if need_list:
-            if os.environ.get("BOSS_LIST_STDIN"):
-                raw = sys.stdin.buffer.read().decode("utf-8-sig")
-                if not raw.strip():
-                    p.error("--mode detail 检测到管道但没有数据（stdin 为空）")
-                list_data = json.loads(raw)
-                print(f"从 stdin 加载 {len(list_data.get('jobs', []))} 条")
-            else:
-                latest = find_latest_list_file()
-                if latest is None:
-                    p.error("--mode detail 缺少列表：请先 --mode search 抓列表，或通过管道传入列表，或直接用 --job_link 传链接")
-                if not (link_tokens or id_tokens):
-                    p.error("--mode detail 未指定 --job_id/--job_link，且列表来自自动加载；为避免误抓全部岗位，请指定其一，或通过管道传入精选列表")
-                with open(latest, encoding="utf-8-sig") as f:
-                    list_data = json.load(f)
-                print(f"自动加载最新列表 {len(list_data.get('jobs', []))} 条: {latest}")
-            if id_tokens:
-                id_jobs, missing = filter_jobs_by_ids(list_data, id_tokens)
-                print(f"按 job_id 精选详情：选中 {len(id_jobs)} 条"
-                      + (f"，未匹配 {len(missing)} 个 id" if missing else ""))
-                if missing:
-                    print("  未匹配 job_id: " + ", ".join(sorted(missing)))
-                detail_jobs = link_jobs + id_jobs
-            else:
-                detail_jobs = list_data.get("jobs", [])
-                print(f"未指定 --job_id，将对列表内 {len(detail_jobs)} 条全部抓详情（建议精选 <=3 条）")
-        else:
             detail_jobs = link_jobs
+        elif os.environ.get("BOSS_LIST_STDIN"):
+            raw = sys.stdin.buffer.read().decode("utf-8-sig")
+            if not raw.strip():
+                p.error("--mode detail 检测到管道但没有数据（stdin 为空）")
+            list_data = json.loads(raw)
+            print(f"从 stdin 加载 {len(list_data.get('jobs', []))} 条")
+            detail_jobs = list_data.get("jobs", [])
+            print(f"未指定 --job_link，将对列表内 {len(detail_jobs)} 条全部抓详情（建议精选 <=3 条）")
+        else:
+            latest = find_latest_list_file()
+            if latest is None:
+                p.error("--mode detail 缺少列表：请先 --mode search 抓列表，或通过管道传入列表，或直接用 --job_link 传链接")
+            p.error("--mode detail 未指定 --job_link，且列表来自自动加载；为避免误抓全部岗位，请用 --job_link 精选，或通过管道传入精选列表")
         if detail_jobs:
             stream_callback = None
             if args.stream_json:
