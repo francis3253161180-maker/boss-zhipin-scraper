@@ -38,9 +38,6 @@ python3 scripts/boss_cdp_raw.py --mode search --keyword "AI Agent" --city 上海
 # 可选：读取首页个性化推荐与最新职位
 python3 scripts/boss_cdp_raw.py --mode homepage --homepage-url "https://www.zhipin.com/chengdu/?ka=header-home" --stdout
 
-# 可选：读取收件箱沟通进度（不含消息预览和正文）
-python3 scripts/boss_cdp_raw.py --mode inbox --stdout
-
 # 可选：仅发现收件箱 JSON/WebSocket 协议字段结构（不输出任何会话内容）
 python3 scripts/boss_cdp_raw.py --mode inbox-discover --stdout
 
@@ -78,7 +75,6 @@ python3 scripts/job_summary.py
 
 - 明文薪资（API 模式，绕过字体反爬）
 - 首页个性化推荐与最新职位的原生响应捕获（`--mode homepage`）
-- 收件箱沟通进度读取：公司、关联岗位、未读数、最后活动时间（不读取聊天正文）；`inbox-discover` 可额外汇总 JSON/WebSocket 信封字段结构
 - 指定当前会话只读：`inbox-read-active` 在主消息区标题校验联系人后，仅提取页面已渲染的逻辑消息行及消息类型；不读取其它会话、不加载更早历史、不发送
 - 单次确认发送：`inbox-send-active` 必须同时提供当前会话联系人、精确文本和 `--confirm-send`；无搜索、无队列、无附件、无自动重试，发送后仅校验该文本是否出现在当前会话
 - 批量投递（`--mode send`）：打开 `--job_link` 指定的 JD → 点击「立即沟通/继续沟通」让 BOSS 自动打开并切换会话 → 发送精确 `--content`；发送后不关闭消息页，立即回读聊天历史最后一条做校验，返回 `send_success`/`verified_last_sender`/`verified_last_text`；串行低频、每岗位只发一次、失败不自动重试，检测到风控立即停止整个批次
@@ -96,7 +92,6 @@ python3 scripts/job_summary.py
 
 - 列表搜索使用页面原生网络响应捕获，不再注入第二个同步 XHR，也不在正式搜索前发送固定登录探测。
 - 首页模式捕获页面自身的 `recommend/job/list.json` 响应：`sortType=1` 标记为 `selected`（精选岗位），`sortType=2` 标记为 `latest`（最新职位）。
-- 收件箱模式捕获页面自身的会话列表响应，仅输出公司、关联岗位、未读数、最后活动时间与加密关联标识；招聘者姓名、头像、消息预览和正文均不输出。
 - `--check` 只检查依赖和 CDP，不访问 BOSS；真实目标搜索才是登录态和接口可用性的判断依据。
 - `--stdout` 在完成后输出一个完整 JSON 文档；`--stream-json`（仅 detail）每完成一个岗位输出一行 NDJSON。
 - `--job_link` 直链详情会从渲染页面补齐可见的标题、公司、薪资、地点、标签和公司链接；不存在的字段保持为空。
@@ -208,7 +203,7 @@ python3 scripts/job_summary.py --top 15
 | `--list-cities [关键词]` | 打印支持的城市列表，可选关键词过滤，如 `--list-cities 江` |
 | `--pages` | 页数（上限 10） |
 | `--format` | json / csv；csv 会同时导出列表和详情 CSV |
-| `--mode search/detail/homepage/inbox/send/read` | 列表搜索、精选详情、首页推荐/最新职位、收件箱进度、批量投递或会话读取 |
+| `--mode search/detail/homepage/send/read` | 列表搜索、精选详情、首页推荐/最新职位、批量投递或会话读取 |
 | `--content` | `send` 模式要发送的精确文案（必填，最多 500 字符） |
 | `--list` | `read` 模式：列出侧边栏所有会话摘要（名称/公司/job_link/已读或送达/时间） |
 | `--chat` | `read` 模式：读取聊天；无附加参数=读当前选中会话，配 `--job_link`=从 JD 进入，配 `--switch-index`=直切侧边栏会话 |
@@ -216,8 +211,8 @@ python3 scripts/job_summary.py --top 15
 | `--expect-contact` | `inbox-read-active` / `read --chat` 的当前会话联系人校验姓名 |
 | `--max-chat-items` | `inbox-read-active` / `read` 最多输出的已渲染消息条数（1–200） |
 | `--homepage-url` | `homepage` 模式目标首页地址 |
-| `--inbox-url` | `inbox` / `inbox-discover` 的目标收件箱地址 |
-| `--capture-seconds` | `homepage` / `inbox` 原生响应捕获窗口，5–30 秒 |
+| `--inbox-url` | `inbox-discover` / `read --list` 的目标消息页地址 |
+| `--capture-seconds` | `homepage` / `inbox-discover` 原生响应捕获窗口，5–30 秒 |
 | `--job_link` | 按完整岗位链接选择详情（唯一岗位选择参数，含 lid/securityId） |
 | `--stdout` | 完成后输出一个完整 JSON 文档 |
 | `--stream-json` | detail 模式每完成一个岗位输出一行 NDJSON |
@@ -283,7 +278,6 @@ boss-zhipin-scraper/
 
 1. 通过 Chrome DevTools Protocol (CDP) 连接到已打开的 Chrome
 2. 导航到目标搜索页或首页，通过 CDP Network 事件捕获页面自身的职位 JSON 响应
-3. 收件箱读取仅走页面原生会话列表响应；不读取消息正文，也不提供自动发送消息能力。
 3. 原生页面响应包含明文 `salaryDesc`，并保留 `securityId` / `lid` 等上下文
 4. 详情页串行打开并从渲染页面提取 JD 和直链模式缺失的可见字段
 5. 每条完成数据原子写入文件，按 `job_id` 去重

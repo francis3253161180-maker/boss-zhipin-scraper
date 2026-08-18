@@ -1384,34 +1384,6 @@ class NativeFlowRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.discover_inbox_endpoints("https://example.com/", capture_seconds=5)
 
-    def test_inbox_normalizer_returns_progress_metadata_without_message_content(self):
-        module = load_module()
-        conversations = module.normalize_inbox_conversations({
-            "code": 0,
-            "zpData": {"result": [{
-                "encryptUid": "conversation-1",
-                "encryptJobId": "job-1",
-                "securityId": "security-1",
-                "sourceTitle": "大模型算法实习生",
-                "brandName": "示例公司",
-                "title": "算法负责人",
-                "chatStatus": "已沟通",
-                "unreadMsgCount": 2,
-                "lastTime": "刚刚",
-                "lastTS": 123456789,
-                "lastMsg": "这是一条私聊正文，不应输出",
-                "lastMessageInfo": {"content": "私聊预览，不应输出"},
-                "name": "招聘者姓名，不应输出",
-            }]},
-        })
-        rendered = json.dumps(conversations, ensure_ascii=False)
-        self.assertEqual(conversations[0]["company"], "示例公司")
-        self.assertEqual(conversations[0]["unread_count"], 2)
-        self.assertIn("securityId=security-1", conversations[0]["job_link"])
-        self.assertNotIn("私聊正文", rendered)
-        self.assertNotIn("私聊预览", rendered)
-        self.assertNotIn("招聘者姓名", rendered)
-
     def test_homepage_url_must_stay_on_zhipin(self):
         module = load_module()
         with self.assertRaises(ValueError):

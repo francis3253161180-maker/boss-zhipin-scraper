@@ -11,7 +11,6 @@
 # Core functional modes (see engine --help):
 #   .\boss.ps1 --mode search --keyword "agent开发" --city 北京 --pages 3 [--stdout] [筛选参数]
 #   .\boss.ps1 --mode homepage --homepage-url "https://www.zhipin.com/chengdu/?ka=header-home" --stdout
-#   .\boss.ps1 --mode inbox --stdout  # 只读沟通进度，不输出私聊正文
 #   .\boss.ps1 --mode inbox-discover --stdout  # 只读协议字段结构，不输出私聊正文
 #   .\boss.ps1 --mode inbox-read-active --expect-contact "刘姗" --stdout  # 仅读当前已选会话
 #   .\boss.ps1 --mode inbox-send-active --expect-contact "杨先生" --message "你好" --confirm-send --stdout  # 单次已确认发送

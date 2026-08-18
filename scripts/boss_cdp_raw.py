@@ -839,56 +839,11 @@ def wait_for_inbox_endpoint_metadata(cdp, sid, timeout=12):
     return metadata, websocket_frames
 
 
-def normalize_inbox_conversations(data):
-    """Return non-content conversation metadata from BOSS's native inbox list."""
-    if not isinstance(data, dict):
-        return []
-    raw_code = data.get("code")
-    try:
-        code = int(raw_code) if raw_code is not None else 0
-    except (TypeError, ValueError):
-        code = -1
-    if code != 0:
-        raise BossAPIError(code, str(data.get("message") or data.get("msg") or ""))
-
-    items = (data.get("zpData") or {}).get("result") or []
-    conversations = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        security_id = item.get("securityId") or ""
-        encrypt_job_id = item.get("encryptJobId") or ""
-        job_link = ""
-        if encrypt_job_id:
-            job_link = "https://www.zhipin.com/job_detail/" + str(encrypt_job_id) + ".html"
-            if security_id:
-                job_link = build_detail_url({
-                    "job_link": job_link,
-                    "security_id": security_id,
-                })
-        conversations.append({
-            "conversation_id": item.get("encryptUid") or item.get("encryptBossId") or "",
-            "job_id": encrypt_job_id,
-            "job_title": item.get("sourceTitle") or item.get("jobName") or "",
-            "company": item.get("brandName") or "",
-            "recruiter_title": item.get("title") or "",
-            "chat_status": item.get("chatStatus") or "",
-            "unread_count": item.get("unreadMsgCount") or 0,
-            "last_time": item.get("lastTime") or "",
-            "last_timestamp": item.get("lastTS") or "",
-            "is_top": bool(item.get("isTop")),
-            "source_type": item.get("sourceType") or "",
-            "job_source": item.get("jobSource") or "",
-            "job_link": job_link,
-        })
-    return conversations
-
-
-def wait_for_native_inbox_list(cdp, sid, timeout=15, normalized=True):
+def wait_for_native_inbox_list(cdp, sid, timeout=15):
     """Capture the page's native conversation-list response, without DOM scraping.
 
-    normalized=True 返回精简会话元数据（默认，兼容收件箱模式）；normalized=False
-    返回 zpData.result 原始项（含 lastMessageInfo 等完整字段，供 read --list 使用）。
+    Returns the raw ``zpData.result`` items (including ``lastMessageInfo``), which
+    the ``read --list`` path merges with the rendered sidebar.
     """
     pending = {}
     deadline = time.time() + timeout
@@ -929,8 +884,6 @@ def wait_for_native_inbox_list(cdp, sid, timeout=15, normalized=True):
                     api_code,
                     str(payload.get("message") or payload.get("msg") or ""),
                 )
-            if normalized:
-                return normalize_inbox_conversations(payload)
             items = (payload.get("zpData") or {}).get("result") or []
             return [it for it in items if isinstance(it, dict)]
     raise TimeoutError(f"等待页面原生 {INBOX_FRIEND_LIST_PATH} 响应超时")
@@ -1874,55 +1827,6 @@ def discover_inbox_endpoints(inbox_url, cdp_port=DEFAULT_CDP_PORT,
         "websocket_frames": websocket_frames,
         "privacy": "只返回接口路径、查询键名和 JSON/WebSocket 字段结构；不返回联系人、消息预览或正文。",
     }
-
-
-def scrape_inbox(inbox_url, output_path, cdp_port=DEFAULT_CDP_PORT,
-                 capture_seconds=15):
-    """Return inbox progress metadata, excluding recruiter name and message content."""
-    parsed = urlparse(inbox_url)
-    if parsed.scheme != "https" or parsed.netloc not in {"www.zhipin.com", "zhipin.com"}:
-        raise ValueError("--inbox-url 必须是 https://www.zhipin.com/ 下的地址")
-
-    cdp = CDPSession(cdp_port)
-    stream_mode = (output_path == "-")
-    if not output_path:
-        output_path = default_output_path("inbox")
-    tid, sid = create_page_session(cdp)
-    cdp.send("Network.enable", {}, sid)
-    try:
-        incr_request()
-        cdp.send("Page.navigate", {"url": inbox_url}, sid)
-        conversations = wait_for_native_inbox_list(
-            cdp, sid, timeout=capture_seconds,
-        )
-    finally:
-        try:
-            cdp.send("Target.closeTarget", {"targetId": tid})
-        except (KeyError, websocket.WebSocketException, TimeoutError):
-            log.debug("关闭收件箱 target 失败", exc_info=True)
-        try:
-            cdp.close()
-        except websocket.WebSocketException:
-            log.debug("关闭收件箱 CDP 连接失败", exc_info=True)
-
-    unread_total = sum(
-        count for count in (item.get("unread_count") for item in conversations)
-        if isinstance(count, int)
-    )
-    result = {
-        "mode": "inbox",
-        "inbox_url": inbox_url,
-        "scraped_at": datetime.now().isoformat(),
-        "conversation_total": len(conversations),
-        "unread_total": unread_total,
-        "conversations": conversations,
-        "privacy": "不输出招聘者姓名、头像、消息预览或消息正文。",
-    }
-    if not stream_mode:
-        write_json_atomic(output_path, result)
-        print(f"收件箱: {len(conversations)} 个会话，未读 {unread_total} 条")
-        print(f"已保存: {output_path}")
-    return result
 
 
 # This extractor is intentionally scoped to the already selected conversation.
@@ -3193,7 +3097,7 @@ def list_chat_conversations(inbox_url=DEFAULT_INBOX_URL, cdp_port=DEFAULT_CDP_PO
         cdp.send("Network.enable", {}, sid)
         incr_request()
         cdp.send("Page.navigate", {"url": inbox_url}, sid)
-        native = wait_for_native_inbox_list(cdp, sid, timeout=20, normalized=False)
+        native = wait_for_native_inbox_list(cdp, sid, timeout=20)
         _chat_page_risk_check(cdp, sid, "消息页")
         time.sleep(2.0)  # 等侧边栏完成渲染
         raw = cdp.eval_js(EXTRACT_SIDEBAR_CONVERSATIONS_JS, sid)
@@ -3454,7 +3358,7 @@ def _capture_native_items_temp(cdp, timeout=20):
         incr_request()
         cdp.send("Page.navigate", {"url": DEFAULT_INBOX_URL}, temp_sid)
         items = wait_for_native_inbox_list(
-            cdp, temp_sid, timeout=timeout, normalized=False,
+            cdp, temp_sid, timeout=timeout,
         )
         _chat_page_risk_check(cdp, temp_sid, "消息页")
         return items
@@ -4306,9 +4210,6 @@ def main():
   # 只读发现收件箱数据接口（不输出联系人或聊天内容）
   %(prog)s --mode inbox-discover --stdout
 
-  # 收件箱沟通进度（仅公司/岗位/未读/时间，不读取正文）
-  %(prog)s --mode inbox --stdout
-
   # 显式读取专用 Chrome 当前已选会话的已渲染内容（不切换/不滚动/不发送）
   %(prog)s --mode inbox-read-active --expect-contact "刘姗" --stdout
 
@@ -4349,9 +4250,9 @@ def main():
     p.add_argument("--homepage-url", default=DEFAULT_HOMEPAGE_URL,
                    help=f"homepage 模式目标地址（默认 {DEFAULT_HOMEPAGE_URL}）")
     p.add_argument("--inbox-url", default=DEFAULT_INBOX_URL,
-                   help=f"inbox/inbox-discover 模式目标地址（默认 {DEFAULT_INBOX_URL}）")
+                   help=f"inbox-discover / read --list 模式目标地址（默认 {DEFAULT_INBOX_URL}）")
     p.add_argument("--capture-seconds", type=int, default=15,
-                   help="homepage/inbox 模式捕获原生响应的秒数（5-30，默认 15）")
+                   help="homepage/inbox-discover 模式捕获原生响应的秒数（5-30，默认 15）")
     p.add_argument("--expect-contact", default=None,
                    help="inbox-read-active 的当前会话校验联系人姓名（必填）")
     p.add_argument("--max-chat-items", type=int, default=None,
@@ -4384,8 +4285,8 @@ def main():
     p.add_argument("--max-details", type=int, default=None, help="detail 模式最多抓几个详情")
     p.add_argument("--job_link", dest="job_links", default=None,
                    help="按完整 job_link 精选详情 / send 投递 / read 读取目标（逗号分隔；含 lid/securityId，无需列表文件；唯一岗位选择参数，已取代 --job_id）")
-    p.add_argument("--mode", choices=["search", "detail", "homepage", "inbox", "inbox-discover", "inbox-read-active", "inbox-send-active", "send", "read"], default="search",
-                   help="功能模式：search=多条件检索；detail=精选详情；homepage=首页推荐/最新职位；inbox=收件箱进度；inbox-discover=只读发现接口；inbox-read-active=读取当前已选会话；inbox-send-active=单次确认发送；send=打开 JD → 点击立即沟通/继续沟通 → 发送 --content；read=读取聊天（--list 列会话 / --chat 读当前选中会话 / --chat --job_link 从 JD 进入 / --chat --switch-index 直切侧边栏会话）")
+    p.add_argument("--mode", choices=["search", "detail", "homepage", "inbox-discover", "inbox-read-active", "inbox-send-active", "send", "read"], default="search",
+                   help="功能模式：search=多条件检索；detail=精选详情；homepage=首页推荐/最新职位；inbox-discover=只读发现接口；inbox-read-active=读取当前已选会话；inbox-send-active=单次确认发送；send=打开 JD → 点击立即沟通/继续沟通 → 发送 --content；read=读取聊天（--list 列会话 / --chat 读当前选中会话 / --chat --job_link 从 JD 进入 / --chat --switch-index 直切侧边栏会话）")
     p.add_argument("--stdout", action="store_true",
                    help="结果 JSON 输出到 stdout（不写文件；日志走 stderr，可用 2>log.txt 分离）")
     p.add_argument("--stream-json", action="store_true",
@@ -4483,24 +4384,6 @@ def main():
             print(f"收件箱接口: {inbox_data['endpoint_count']} 个（仅字段结构，未输出任何私聊内容）")
             for endpoint in inbox_data["endpoints"]:
                 print(f"  {endpoint['path']} | keys: {', '.join(endpoint['zp_data_keys'][:8])}")
-        sys.exit(0)
-
-    if args.mode == "inbox":
-        args.capture_seconds = max(5, min(30, args.capture_seconds))
-        try:
-            inbox_data = scrape_inbox(
-                args.inbox_url,
-                "-" if args.stdout else args.output,
-                cdp_port=args.cdp_port,
-                capture_seconds=args.capture_seconds,
-            )
-        except (BossAPIError, TimeoutError, RuntimeError, ValueError) as exc:
-            print(f"❌ 收件箱进度读取失败: {exc}")
-            sys.exit(2)
-        if args.stdout:
-            json.dump(inbox_data, real_stdout, ensure_ascii=False, indent=2)
-            real_stdout.write("\n")
-            real_stdout.flush()
         sys.exit(0)
 
     if args.mode == "inbox-read-active":

@@ -36,9 +36,6 @@ python3 scripts/boss_cdp_raw.py --mode search --keyword "AI Agent" --city 上海
 # Optional: capture personalized homepage recommendations and latest jobs
 python3 scripts/boss_cdp_raw.py --mode homepage --homepage-url "https://www.zhipin.com/chengdu/?ka=header-home" --stdout
 
-# Optional: read inbox progress without message previews or bodies
-python3 scripts/boss_cdp_raw.py --mode inbox --stdout
-
 # Optional: discover inbox JSON/WebSocket envelope schemas without any chat content
 python3 scripts/boss_cdp_raw.py --mode inbox-discover --stdout
 
@@ -76,7 +73,6 @@ Right after scraping you get: salary ranges, experience requirements, top skill 
 
 - Plaintext salary (API mode, bypasses font-based obfuscation)
 - Native homepage response capture for personalized and latest jobs (`--mode homepage`)
-- Inbox-progress reads for company/job/unread/last-activity metadata only (no message body)
 - Batch delivery (`--mode send`): opens each `--job_link` JD, clicks `立即沟通`/`继续沟通` so BOSS opens and switches to the conversation, then sends the exact `--content` with one Enter; after sending it keeps the chat page open, reads back the last history row, and returns `send_success`/`verified_last_sender`/`verified_last_text`; serial and low-frequency, one send per job, no automatic retry, and immediate batch abort on risk control
 - Conversation read (`--mode read`) variants: `--list` merges the native conversation list with the rendered sidebar to return each conversation's name/avatar/company/job_link/read-or-delivered status, last message (sender `self`/`other`, read state 已读/送达/未读, text, time), unread count, pinned/selected flags, and sidebar `index`; `--chat` reads the currently selected conversation on the open chat page; `--chat --job_link` prefers switching the sidebar row directly on the already open chat page and falls back to opening the JD when switching fails or no chat page is open (`entered_via: sidebar|job_link`, summary counts `via_sidebar`/`via_job_link`); `--chat --switch-index N` switches directly by clicking sidebar indices with trusted mouse events (no job_link reopen). Reads only the currently rendered chat history with per-message `sender` (`self`/`other`/`system`/`platform`/`attachment`/`unknown`); no older-history scrolling, never sends, stdout-only so chat bodies are not written to disk
 - Boss activity status as a separate field (`boss_active_status`): list maps `bossOnline`→"在线"; detail can provide finer labels like "刚刚活跃"
@@ -92,7 +88,6 @@ Right after scraping you get: salary ranges, experience requirements, top skill 
 
 - List search captures the page's native `joblist.json` network response. It does not inject a second synchronous XHR or send a fixed preflight login probe.
 - Homepage mode captures the page's own `recommend/job/list.json` responses: `sortType=1` is `selected`, while `sortType=2` is `latest`.
-- Inbox mode captures the page's native conversation list but emits only company, linked job, unread count, and activity metadata; recruiter names, previews, and bodies are excluded.
 - `--check` is local-only: dependencies and CDP connectivity. The real target search is the source of truth for login and API availability.
 - `--stdout` emits one final JSON document; detail-only `--stream-json` emits one NDJSON object after each completed job.
 - Direct `--job_link` detail mode fills visible title, company, salary, location, tags, and company link fields from the rendered page when available.
@@ -204,7 +199,7 @@ python3 scripts/job_summary.py --top 15
 | `--list-cities [keyword]` | Print the supported city list, optional keyword filter, e.g. `--list-cities 江` |
 | `--pages` | Number of pages (max 10) |
 | `--format` | json / csv; csv also exports list and detail CSVs |
-| `--mode search/detail/homepage/inbox/send/read` | Search lists, fetch selected details, capture homepage jobs, read inbox progress, batch-deliver, or read conversations |
+| `--mode search/detail/homepage/send/read` | Search lists, fetch selected details, capture homepage jobs, batch-deliver, or read conversations |
 | `--content` | Exact text to send in `send` mode (required, max 500 chars) |
 | `--list` | In `read` mode: list all sidebar conversations (name/company/job_link/read-or-delivered status/time) |
 | `--chat` | In `read` mode: read chat; alone = current selection, with `--job_link` = enter that conversation, with `--switch-index` = click sidebar indices |
@@ -212,8 +207,8 @@ python3 scripts/job_summary.py --top 15
 | `--expect-contact` | Contact name verification for `inbox-read-active` / `read --chat` |
 | `--max-chat-items` | Max rendered message rows output by `inbox-read-active` / `read` (1–200) |
 | `--homepage-url` | Target homepage URL for `homepage` mode |
-| `--inbox-url` | Target inbox URL for `inbox` / `inbox-discover` mode |
-| `--capture-seconds` | Native homepage/inbox-response window, 5–30 seconds |
+| `--inbox-url` | Target chat-page URL for `inbox-discover` / `read --list` mode |
+| `--capture-seconds` | Native homepage/inbox-discover response window, 5–30 seconds |
 | `--job_link` | Fetch details directly from complete links (the only job-selection parameter, includes `lid`/`securityId`) |
 | `--stdout` | Emit one final JSON document |
 | `--stream-json` | Detail-only NDJSON, one completed job per line |
@@ -280,7 +275,6 @@ This is a Chrome-CDP-based BOSS Zhipin crawler. Core flow:
 
 1. Connect to an already-open Chrome via the Chrome DevTools Protocol (CDP)
 2. Navigate to the target search page or homepage and capture the page's native job JSON responses with CDP Network events
-3. Inbox reads use the page's native conversation-list response only; message bodies are excluded and automated sending is not provided.
 3. The native response returns plaintext `salaryDesc` and preserves `securityId` / `lid` context
 4. Open detail pages serially and extract JD plus visible direct-link metadata
 5. Write each completed result atomically and dedupe by `job_id`

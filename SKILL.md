@@ -50,7 +50,6 @@ Timing policy: wait 8–15 seconds between search pages; wait 5–8 seconds afte
 .\boss-zhipin-scraper\boss.ps1 --check
 .\boss-zhipin-scraper\boss.ps1 --mode search --keyword "agent开发实习" --city 北京 --pages 1 --stdout
 .\boss-zhipin-scraper\boss.ps1 --mode homepage --homepage-url "https://www.zhipin.com/chengdu/?ka=header-home" --stdout
-.\boss-zhipin-scraper\boss.ps1 --mode inbox --stdout
 .\boss-zhipin-scraper\boss.ps1 --mode inbox-discover --stdout
 .\boss-zhipin-scraper\boss.ps1 --mode inbox-read-active --expect-contact "刘姗" --stdout
 .\boss-zhipin-scraper\boss.ps1 --mode inbox-send-active --expect-contact "杨先生" --message "你好" --confirm-send --stdout
@@ -75,7 +74,7 @@ cp boss-zhipin-scraper/scripts/job_summary.py ~/.hermes/skills/data-science/boss
 
 `homepage` output contains a flattened deduplicated `jobs` list plus `sections.selected` and `sections.latest`. Each job keeps `homepage_sections` and native response provenance so repeated jobs remain traceable.
 
-`inbox` only returns job-progress metadata: company, linked job, unread count, last activity time and opaque conversation IDs. `inbox-discover` may summarize JSON/WebSocket envelope keys, but never recruiter names, chat previews, or message bodies.
+`inbox-discover` may summarize JSON/WebSocket envelope keys, but never recruiter names, chat previews, or message bodies.
 
 `--mode send` is the explicit batch-delivery sender the user asked for: it opens each `--job_link` JD in the dedicated Chrome, clicks `立即沟通`/`继续沟通` so BOSS itself opens and switches to the conversation, verifies the rendered composer contains the exact `--content`, then sends it with a trusted Enter sequence (rawKeyDown + char + keyUp). After sending it keeps the chat page open and immediately reads back the last rendered history row: when it matches `--content`, `send_success=true`, and the result also carries `verified_last_sender` (self/other) and `verified_last_text` (raw read-back, truncated to 200 chars); the batch summary adds `sent_verified`. It runs serially with 8-15s pacing and sends each job at most once. Existing fields `post_send_visible` (outgoing-text count confirmed by a bounded ≤6s poll, timestamp-aware) and `composer_cleared_after_send` remain; a failed confirmation is reported but never auto-resends. Risk-control markers abort the whole batch immediately. A 5-second pre-flight countdown with Ctrl+C precedes the first send.
 `--mode read` has three forms. `--list` captures the native conversation-list response (raw `getGeekFriendList.json` items, so it never reloads the open chat page) and merges it with the rendered sidebar rows to return every conversation's name, avatar, company, linked `job_link`, read/delivered status, last message (sender `self`/`other` via `last_message_sender`, read state 已读/送达/未读 via `last_message_read`, text, time), unread count, pinned/selected flags, and a 0-based sidebar `index` that can be fed straight into `--chat --switch-index`. `--chat` attaches to the already open chat page and reads only the currently selected conversation (never reopens, never switches). `--chat --job_link` prefers switching the matching sidebar row on the already open chat page with trusted mouse events and only falls back to opening the JD and clicking `立即沟通`/`继续沟通` when switching fails or no chat page is open; each result carries `entered_via` (`sidebar`/`job_link`) and the summary reports `via_sidebar`/`via_job_link`. `--chat --switch-index 0,1` clicks the rendered sidebar rows directly with trusted mouse events (BOSS's SPA ignores element.click()) and reads each history without reopening any job_link. Every row is tagged with `sender` direction (`self` = 自己发送, `other` = 对方发送, plus `system`/`platform`/`attachment`/`unknown`). All read forms are stdout-only (`--stdout`), never type or send, and do not scroll for older history; risk-control markers abort the batch.
@@ -86,11 +85,11 @@ cp boss-zhipin-scraper/scripts/job_summary.py ~/.hermes/skills/data-science/boss
 
 ## Inbox interface register and extension rules
 
-The inbox workflow is deliberately split into **progress monitoring**, **one named conversation**, and **external actions**. The default must always remain the first category.
+The chat workflow is split into **sidebar progress monitoring** (`--mode read --list`), **one named conversation** (`inbox-read-active`), and **external actions** (`inbox-send-active`, `--mode send`).
 
 | Native interface / transport | Current handling | Permitted future use |
 | --- | --- | --- |
-| `friend/getGeekFriendList.json` | Implemented by `--mode inbox`: company, linked-job key, unread count, last activity, opaque conversation ID | Synchronize application progress and match a reply to one locally stored job |
+| `friend/getGeekFriendList.json` | Implemented by `--mode read --list`: company, linked-job key, unread count, last activity, opaque conversation ID | Synchronize application progress and match a reply to one locally stored job |
 | `friend/geekFilterByLabel` | Discovered; not yet exposed as a CLI option | Add explicit filters such as unread/new greeting only after the page exposes stable label IDs; output metadata only |
 | `zpchat/config/ws` | Discovered; `--mode inbox-discover` passively reports WebSocket envelope schema without values | Establish whether a **specific named conversation** uses history, receipt, or send message types |
 | `zpchat/gray/get` | Discovered only | Inspect support flags once when a feature is blocked; do not alter read/notification settings |
