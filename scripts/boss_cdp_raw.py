@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.9.0"
+__version__ = "2.11.0"
 
 import json
 import time
@@ -418,9 +418,11 @@ def attach_active_inbox_target(cdp):
             continue
         if parsed.path.startswith("/web/geek/chat"):
             candidates.append(target)
-    if len(candidates) != 1:
-        raise RuntimeError(
-            "未找到唯一的专用 BOSS 消息页；请只保留并打开目标会话后再读取"
+    if not candidates:
+        raise RuntimeError("未找到已打开的 BOSS 消息页（/web/geek/chat）")
+    if len(candidates) > 1:
+        log.warning(
+            f"检测到 {len(candidates)} 个 BOSS 消息页，将使用第一个进行会话切换"
         )
     target = candidates[0]
     attached = cdp.send(
@@ -882,8 +884,12 @@ def normalize_inbox_conversations(data):
     return conversations
 
 
-def wait_for_native_inbox_list(cdp, sid, timeout=15):
-    """Capture the page's native conversation-list response, without DOM scraping."""
+def wait_for_native_inbox_list(cdp, sid, timeout=15, normalized=True):
+    """Capture the page's native conversation-list response, without DOM scraping.
+
+    normalized=True 返回精简会话元数据（默认，兼容收件箱模式）；normalized=False
+    返回 zpData.result 原始项（含 lastMessageInfo 等完整字段，供 read --list 使用）。
+    """
     pending = {}
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -913,7 +919,20 @@ def wait_for_native_inbox_list(cdp, sid, timeout=15):
                 payload = json.loads(body)
             except (json.JSONDecodeError, ValueError) as exc:
                 raise RuntimeError("BOSS 原生收件箱响应不是有效 JSON") from exc
-            return normalize_inbox_conversations(payload)
+            raw_code = payload.get("code") if isinstance(payload, dict) else None
+            try:
+                api_code = int(raw_code) if raw_code is not None else 0
+            except (TypeError, ValueError):
+                api_code = -1
+            if api_code != 0:
+                raise BossAPIError(
+                    api_code,
+                    str(payload.get("message") or payload.get("msg") or ""),
+                )
+            if normalized:
+                return normalize_inbox_conversations(payload)
+            items = (payload.get("zpData") or {}).get("result") or []
+            return [it for it in items if isinstance(it, dict)]
     raise TimeoutError(f"等待页面原生 {INBOX_FRIEND_LIST_PATH} 响应超时")
 
 # ============================================================
@@ -975,6 +994,7 @@ class DetailLoginRequiredError(DetailExtractionError):
 EXTRACT_DETAIL_JS = r"""
 (function(){
     var pageText = document.body ? document.body.innerText : '';
+    var pageHtml = document.documentElement ? document.documentElement.innerHTML : '';
     function firstText(selectors) {
         for (var i = 0; i < selectors.length; i++) {
             var el = document.querySelector(selectors[i]);
@@ -1037,6 +1057,20 @@ EXTRACT_DETAIL_JS = r"""
         var m = (document.title || '').match(/「(.+?)招聘」/);
         if (m) title = m[1];
     }
+    // Preserve an explicit page-level state.  The shortlist excludes only
+    // pages that visibly say they are closed; an omitted label is not closure.
+    var jobStatus = '';
+    if (pageText.indexOf('职位已关闭') !== -1 || pageText.indexOf('停止招聘') !== -1
+        || pageHtml.indexOf('职位已关闭') !== -1 || pageHtml.indexOf('停止招聘') !== -1) {
+        jobStatus = '已关闭';
+    } else if (pageText.indexOf('招聘中') !== -1 || pageHtml.indexOf('招聘中') !== -1) {
+        jobStatus = '招聘中';
+    }
+    var contactAvailable = false;
+    document.querySelectorAll('a, button').forEach(function(el){
+        var label = (el.innerText || el.getAttribute('aria-label') || '').trim();
+        if (label === '立即沟通' || label === '继续沟通') contactAvailable = true;
+    });
     var company = '';
     var sider = document.querySelector('.sider-company');
     if (sider) {
@@ -1075,6 +1109,8 @@ EXTRACT_DETAIL_JS = r"""
         tags: tags,
         url: location.href,
         title: title,
+        job_status: jobStatus,
+        contact_available: contactAvailable,
         company: company,
         company_link: companyLink,
         salary: salary,
@@ -1141,6 +1177,12 @@ def resolve_boss_active_status(list_status="", detail_status=""):
     if detail:
         return detail
     return str(list_status or "").strip()
+
+
+def normalize_job_status(value):
+    """Normalize explicit detail-page state without treating omission as closure."""
+    status = str(value or "").strip()
+    return status if status in {"招聘中", "已关闭"} else "未显式标注"
 
 
 def _recruiter_footer_info(lines):
@@ -1236,6 +1278,8 @@ def extract_detail_fields(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
         "jd": jd,
         "boss_active_status": boss_active_status,
         "title": str(extracted.get("title") or "").strip(),
+        "job_status": normalize_job_status(extracted.get("job_status")),
+        "contact_available": bool(extracted.get("contact_available")),
         "company": str(extracted.get("company") or "").strip(),
         "company_link": str(extracted.get("company_link") or "").strip(),
         "salary": str(extracted.get("salary") or "").strip(),
@@ -1910,6 +1954,13 @@ EXTRACT_ACTIVE_INBOX_JS = r"""
     }
     return null;
   }
+  function insideSidebar(node) {
+    for (var n = node; n && n !== document.body; n = n.parentElement) {
+      var name = typeof n.className === 'string' ? n.className : '';
+      if (/(^|[-_ ])(?:friend-content|user-list)(?:[-_ ]|$)/i.test(name)) return true;
+    }
+    return false;
+  }
   var expected = __EXPECTED_CONTACT_JSON__;
   var roots = [];
   var seenRoot = new Set();
@@ -1945,7 +1996,9 @@ EXTRACT_ACTIVE_INBOX_JS = r"""
       var fallback = all[f];
       if (!visible(fallback)) continue;
       var root = messageAncestor(fallback);
-      if (root && !(root.classList && root.classList.contains('last-msg')) && !seenRoot.has(root)) {
+      if (root && !insideSidebar(root)
+          && !(root.classList && root.classList.contains('last-msg'))
+          && !seenRoot.has(root)) {
         seenRoot.add(root);
         roots.push(root);
       }
@@ -2031,7 +2084,11 @@ COUNT_ACTIVE_OUTGOING_TEXT_JS = r"""
   var nodes = Array.prototype.slice.call(document.querySelectorAll('.message-item.item-myself, .message-item.item-self'));
   var count = 0;
   for (var i = 0; i < nodes.length; i++) {
-    if ((nodes[i].innerText || '').replace(/\s+/g, ' ').trim() === expected) count++;
+    var text = (nodes[i].innerText || '').replace(/\s+/g, ' ').trim();
+    // BOSS 在已发送消息前带时间戳前缀（如 "12:45 送达 " 或 "08-14 23:37 送达 "），
+    // 去掉后再做包含匹配，避免全等比较因时间戳永远失配。
+    text = text.replace(/^(?:\d{2}-\d{2}\s+)?\d{1,2}:\d{2}\s*\u9001\u8fbe\s*/, '');
+    if (text.indexOf(expected) !== -1) count++;
   }
   return count;
 })()
@@ -2100,16 +2157,22 @@ def send_active_inbox_text(expected_contact, message, confirmed=False,
             raise RuntimeError("未找到消息输入框；未发送")
         cdp.send("DOM.focus", {"nodeId": composer_id}, sid)
         cdp.send("Input.insertText", {"text": message}, sid)
-        cdp.send("Input.dispatchKeyEvent", {
-            "type": "keyDown", "key": "Enter", "code": "Enter",
-            "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
-        }, sid)
-        cdp.send("Input.dispatchKeyEvent", {
-            "type": "keyUp", "key": "Enter", "code": "Enter",
-            "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
-        }, sid)
-        time.sleep(1.0)
-        after_count = count_active_outgoing_text(cdp, sid, message)
+        time.sleep(0.5)
+        if message not in _read_composer_text(cdp, sid):
+            cdp.eval_js(FOCUS_COMPOSER_JS, sid)
+            cdp.send("Input.insertText", {"text": message}, sid)
+            time.sleep(0.5)
+        if message not in _read_composer_text(cdp, sid):
+            raise RuntimeError("文本未能写入消息输入框，未发送")
+        _dispatch_enter(cdp, sid)
+        time.sleep(1.5)
+        composer_cleared = _read_composer_text(cdp, sid) == ""
+        after_count = before_count
+        for _ in range(6):
+            after_count = count_active_outgoing_text(cdp, sid, message)
+            if after_count > before_count:
+                break
+            time.sleep(1.0)
         return {
             "mode": "inbox-send-active",
             "recipient": str(expected_contact),
@@ -2117,6 +2180,7 @@ def send_active_inbox_text(expected_contact, message, confirmed=False,
             "message": message,
             "submitted": True,
             "post_send_visible": after_count > before_count,
+            "composer_cleared_after_send": composer_cleared,
             "scope": "仅当前已选会话；单次显式确认发送；未切换会话、未重试",
             "sent_at": datetime.now().isoformat(),
         }
@@ -2130,6 +2194,855 @@ def send_active_inbox_text(expected_contact, message, confirmed=False,
             cdp.close()
         except websocket.WebSocketException:
             log.debug("关闭发送收件箱 CDP 连接失败", exc_info=True)
+
+
+class SendRiskControlError(RuntimeError):
+    """检测到 BOSS 风控/环境异常，必须立即停止整个批次（send/read 通用）。"""
+
+
+class SendJobUnavailableError(RuntimeError):
+    """单个岗位无法打开会话（已关闭/无沟通按钮/输入框未出现），跳过但批次继续。"""
+
+
+# read 模式复用同一套异常；通用别名让 read 代码不必带 "Send" 前缀。
+RiskControlError = SendRiskControlError
+JobUnavailableError = SendJobUnavailableError
+
+
+# ============================================================
+# 投递模式（--mode send）：打开 JD → 点击 立即沟通/继续沟通 → 发送 --content
+# 行为边界：串行低频；每个岗位只发一次，失败不自动重试；检测到风控立即停止。
+# ============================================================
+
+SEND_RISK_MARKERS = (
+    "环境异常",
+    "访问过于频繁",
+    "操作频繁",
+    "请完成验证",
+    "验证码",
+    "稍后再试",
+)
+
+CONTACT_BUTTON_STATE_JS = r"""
+(function(){
+  var pageText = document.body ? document.body.innerText : '';
+  var pageHtml = document.documentElement ? document.documentElement.innerHTML : '';
+  var status = '';
+  if (pageText.indexOf('职位已关闭') !== -1 || pageHtml.indexOf('职位已关闭') !== -1
+      || pageText.indexOf('停止招聘') !== -1 || pageHtml.indexOf('停止招聘') !== -1) {
+    status = '已关闭';
+  } else if (pageText.indexOf('招聘中') !== -1 || pageHtml.indexOf('招聘中') !== -1) {
+    status = '招聘中';
+  }
+  var buttons = [];
+  var seen = {};
+  document.querySelectorAll('a, button').forEach(function(el){
+    var label = (el.innerText || el.getAttribute('aria-label') || '').trim();
+    if (label.indexOf('立即沟通') !== -1 || label.indexOf('继续沟通') !== -1) {
+      if (seen[label]) return;
+      seen[label] = true;
+      var rect = el.getBoundingClientRect();
+      buttons.push({label: label, visible: rect.width > 0 && rect.height > 0});
+    }
+  });
+  var riskMarkers = [];
+  ['环境异常','访问过于频繁','操作频繁','请完成验证','验证码','稍后再试'].forEach(function(m){
+    if (pageText.indexOf(m) !== -1) riskMarkers.push(m);
+  });
+  return JSON.stringify({status: status, buttons: buttons, risk_markers: riskMarkers, url: location.href});
+})()
+"""
+
+CLICK_CONTACT_BUTTON_JS = r"""
+(function(){
+  var els = Array.prototype.slice.call(document.querySelectorAll('a, button'));
+  for (var i = 0; i < els.length; i++) {
+    var label = (els[i].innerText || els[i].getAttribute('aria-label') || '').trim();
+    if (label.indexOf('立即沟通') !== -1 || label.indexOf('继续沟通') !== -1) {
+      els[i].click();
+      return JSON.stringify({clicked: label});
+    }
+  }
+  return JSON.stringify({clicked: ''});
+})()
+"""
+
+SCROLL_CONTACT_BUTTON_JS = r"""
+(function(){
+  var els = Array.prototype.slice.call(document.querySelectorAll('a, button'));
+  for (var i = 0; i < els.length; i++) {
+    var label = (els[i].innerText || els[i].getAttribute('aria-label') || '').trim();
+    if (label.indexOf('立即沟通') !== -1 || label.indexOf('继续沟通') !== -1) {
+      els[i].scrollIntoView({block: 'center'});
+      return true;
+    }
+  }
+  return false;
+})()
+"""
+
+CONTACT_BUTTON_RECT_JS = r"""
+(function(){
+  var els = Array.prototype.slice.call(document.querySelectorAll('a, button'));
+  for (var i = 0; i < els.length; i++) {
+    var label = (els[i].innerText || els[i].getAttribute('aria-label') || '').trim();
+    if (label.indexOf('立即沟通') !== -1 || label.indexOf('继续沟通') !== -1) {
+      var rect = els[i].getBoundingClientRect();
+      return JSON.stringify({
+        x: Math.round(rect.left + rect.width / 2),
+        y: Math.round(rect.top + rect.height / 2),
+        visible: rect.width > 0 && rect.height > 0
+      });
+    }
+  }
+  return JSON.stringify({x: 0, y: 0, visible: false});
+})()
+"""
+
+CHAT_COMPOSER_STATE_JS = r"""
+(function(){
+  var el = document.querySelector('[contenteditable="true"]');
+  var tag = '';
+  if (el) {
+    tag = 'contenteditable';
+  } else {
+    el = document.querySelector('textarea');
+    if (el) tag = 'textarea';
+  }
+  var pageText = document.body ? document.body.innerText : '';
+  var riskMarkers = [];
+  ['环境异常','访问过于频繁','操作频繁','请完成验证','验证码','稍后再试'].forEach(function(m){
+    if (pageText.indexOf(m) !== -1) riskMarkers.push(m);
+  });
+  return JSON.stringify({has_input: !!el, tag: tag, risk_markers: riskMarkers, url: location.href});
+})()
+"""
+
+CLEAR_CHAT_COMPOSER_JS = r"""
+(function(){
+  var el = document.querySelector('[contenteditable="true"]');
+  var tag = 'contenteditable';
+  if (!el) {
+    el = document.querySelector('textarea');
+    tag = 'textarea';
+  }
+  if (!el) return JSON.stringify({ok: false});
+  el.focus();
+  if (tag === 'textarea') {
+    el.value = '';
+  } else {
+    el.innerText = '';
+  }
+  return JSON.stringify({ok: true, tag: tag});
+})()
+"""
+
+
+FOCUS_COMPOSER_JS = r"""
+(function(){
+  var el = document.querySelector('[contenteditable="true"]') || document.querySelector('textarea');
+  if (!el) return JSON.stringify({ok: false});
+  el.focus();
+  return JSON.stringify({ok: document.activeElement === el});
+})()
+"""
+
+
+COMPOSER_TEXT_JS = r"""
+(function(){
+  // composer_text helper: return the currently rendered composer content
+  var el = document.querySelector('[contenteditable="true"]') || document.querySelector('textarea');
+  if (!el) return '';
+  return (el.innerText || el.value || '').replace(/\s+/g, ' ').trim();
+})()
+"""
+
+
+EXTRACT_SIDEBAR_CONVERSATIONS_JS = r"""
+(function(){
+  function clean(value, limit) {
+    value = String(value || '').replace(/\s+/g, ' ').trim();
+    return value.length > limit ? value.slice(0, limit) + '…' : value;
+  }
+  var items = Array.prototype.slice.call(document.querySelectorAll('.friend-content'));
+  var out = [];
+  for (var i = 0; i < items.length; i++) {
+    var root = items[i];
+    var nameEl = root.querySelector('.name-text');
+    var timeEl = root.querySelector('.time');
+    var statusEl = root.querySelector('.message-status');
+    var previewEl = root.querySelector('.last-msg-text');
+    var box = root.querySelector('.name-box');
+    var avatarEl = root.querySelector('.figure img');
+    var name = nameEl ? clean(nameEl.innerText, 80) : '';
+    var time = timeEl ? clean(timeEl.innerText, 40) : '';
+    var preview = previewEl ? clean(previewEl.innerText, 200) : '';
+    var avatar = avatarEl ? String(avatarEl.getAttribute('src') || '') : '';
+    var statusClass = statusEl ? String(statusEl.className || '') : '';
+    var status = '未读';
+    if (statusClass.indexOf('status-read') !== -1) status = '已读';
+    else if (statusClass.indexOf('status-delivery') !== -1) status = '送达';
+    var selected = /(?:^|\s)selected(?:\s|$)/.test(String(root.className || ''));
+    var company = '';
+    var title = '';
+    if (box) {
+      var spans = box.querySelectorAll('span');
+      for (var s = 0; s < spans.length; s++) {
+        var txt = clean(spans[s].innerText, 80);
+        if (!txt || txt === name) continue;
+        if (!company) company = txt;
+        else title = txt;
+      }
+    }
+    out.push({index: i, name: name, company: company, title: title,
+              read_status: status, last_time: time, last_message_preview: preview,
+              selected: selected, avatar: avatar});
+  }
+  return JSON.stringify(out);
+})()
+"""
+
+
+CLICK_SIDEBAR_ITEM_JS = r"""
+(function(){
+  var index = __INDEX__;
+  var warps = Array.prototype.slice.call(document.querySelectorAll('.friend-content-warp'));
+  if (index < 0 || index >= warps.length) {
+    return JSON.stringify({ok: false, index: index, count: warps.length});
+  }
+  var li = warps[index].parentElement || warps[index];
+  var rect = li.getBoundingClientRect();
+  return JSON.stringify({ok: true, index: index, count: warps.length,
+                         x: Math.round(rect.left + rect.width / 2),
+                         y: Math.round(rect.top + rect.height / 2)});
+})()
+"""
+
+
+ENTER_KEY_EVENTS = (
+    {"type": "rawKeyDown", "key": "Enter", "code": "Enter",
+     "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
+    {"type": "char", "key": "Enter", "code": "Enter",
+     "text": "\r", "unmodifiedText": "\r",
+     "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
+    {"type": "keyUp", "key": "Enter", "code": "Enter",
+     "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
+)
+
+
+def _dispatch_enter(cdp, sid):
+    """Dispatch a trusted Enter keypress (rawKeyDown + char + keyUp)."""
+    for event in ENTER_KEY_EVENTS:
+        cdp.send("Input.dispatchKeyEvent", event, sid)
+
+
+def _read_composer_text(cdp, sid):
+    """Return the composer's currently rendered text (empty when cleared)."""
+    raw = cdp.eval_js(COMPOSER_TEXT_JS, sid)
+    return raw if isinstance(raw, str) else ""
+
+
+def _parse_send_page_state(cdp, sid, script):
+    """Parse a page-state JSON string returned by Runtime.evaluate."""
+    raw = cdp.eval_js(script, sid)
+    if not isinstance(raw, str):
+        return {}
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _raise_on_risk_markers(state, context=""):
+    markers = state.get("risk_markers") or []
+    if markers:
+        raise SendRiskControlError(
+            (context + " " if context else "") + "检测到 BOSS 风控提示："
+            + "、".join(str(m) for m in markers)
+        )
+
+
+def _snapshot_target_ids(cdp):
+    targets = (cdp.send("Target.getTargets").get("result") or {}).get("targetInfos") or []
+    return {target.get("targetId") for target in targets if target.get("targetId")}
+
+
+def _open_chat_session(cdp, sid, known_target_ids, max_attempts=12):
+    """After a contact click, wait for the chat to open (1s between checks).
+
+    Returns (None, sid) when the current page itself became the chat,
+    (chat_tid, chat_sid) for a popup chat target, or (None, None) on timeout.
+    """
+    for _ in range(max_attempts):
+        state = _parse_send_page_state(cdp, sid, CHAT_COMPOSER_STATE_JS)
+        _raise_on_risk_markers(state, "会话页")
+        if state.get("has_input"):
+            return None, sid
+        chat_tid, chat_sid = _attach_new_chat_target(cdp, known_target_ids)
+        if chat_sid:
+            return chat_tid, chat_sid
+        time.sleep(1.0)
+    return None, None
+
+
+def _click_contact_js(cdp, sid):
+    clicked = _parse_send_page_state(cdp, sid, CLICK_CONTACT_BUTTON_JS)
+    return (clicked.get("clicked") or "").strip()
+
+
+def _click_contact_trusted(cdp, sid):
+    """Trusted mouse click at the contact button center.
+
+    Synthetic el.click() can be treated as a non-user gesture and trigger
+    Chrome's popup blocker for window.open; a CDP mouse event is trusted.
+    """
+    cdp.eval_js(SCROLL_CONTACT_BUTTON_JS, sid)
+    time.sleep(0.6)
+    rect = _parse_send_page_state(cdp, sid, CONTACT_BUTTON_RECT_JS)
+    x = rect.get("x")
+    y = rect.get("y")
+    if not rect.get("visible") or x is None or y is None:
+        return False
+    cdp.send("Input.dispatchMouseEvent", {
+        "type": "mousePressed", "x": x, "y": y,
+        "button": "left", "clickCount": 1,
+    }, sid)
+    cdp.send("Input.dispatchMouseEvent", {
+        "type": "mouseReleased", "x": x, "y": y,
+        "button": "left", "clickCount": 1,
+    }, sid)
+    return True
+
+
+def _attach_new_chat_target(cdp, known_target_ids):
+    """Single-scan for the popup chat target opened after the contact click.
+
+    Retry pacing lives in _open_chat_session (1s per check), so this helper
+    never busy-waits on a wall-clock deadline.
+    """
+    targets = (cdp.send("Target.getTargets").get("result") or {}).get("targetInfos") or []
+    for target in targets:
+        if target.get("type") != "page":
+            continue
+        target_id = target.get("targetId")
+        if not target_id or target_id in known_target_ids:
+            continue
+        parsed = urlparse(target.get("url") or "")
+        if parsed.netloc not in {"www.zhipin.com", "zhipin.com"}:
+            continue
+        attached = cdp.send(
+            "Target.attachToTarget",
+            {"targetId": target_id, "flatten": True},
+        )
+        session_id = (attached.get("result") or {}).get("sessionId")
+        if not session_id:
+            continue
+        return target_id, session_id
+    return None, None
+
+
+def wait_for_chat_composer(cdp, sid, max_attempts=15):
+    """Wait until the chat composer is rendered in target sid (1s between checks)."""
+    for _ in range(max_attempts):
+        state = _parse_send_page_state(cdp, sid, CHAT_COMPOSER_STATE_JS)
+        _raise_on_risk_markers(state, "会话页")
+        if state.get("has_input"):
+            return state
+        time.sleep(1.0)
+    return {}
+
+
+def _focus_chat_composer(cdp, sid):
+    """Focus the chat composer node (contenteditable first, textarea fallback)."""
+    document = cdp.send("DOM.getDocument", {"depth": 1, "pierce": True}, sid)
+    root_id = ((document.get("result") or {}).get("root") or {}).get("nodeId")
+    if not root_id:
+        return None
+    for selector in ('[contenteditable="true"]', "textarea"):
+        selected = cdp.send(
+            "DOM.querySelector", {"nodeId": root_id, "selector": selector}, sid,
+        )
+        node_id = (selected.get("result") or {}).get("nodeId")
+        if node_id:
+            cdp.send("DOM.focus", {"nodeId": node_id}, sid)
+            return node_id
+    return None
+
+
+def _open_job_chat(cdp, link):
+    """Open a JD link and let BOSS open/switch to the job conversation.
+
+    Returns (target_sid, tid, sid, chat_tid, chat_sid) once the chat composer
+    is rendered. target_sid is the session to interact with: the popup chat
+    when BOSS opened one, otherwise the JD page itself. Raises
+    JobUnavailableError when the job is closed or the chat cannot open, and
+    RiskControlError when BOSS shows a risk/verification marker. Targets
+    created before failure are detached and closed before re-raising.
+    """
+    tid = sid = None
+    chat_tid = chat_sid = None
+    try:
+        tid, sid = create_page_session(cdp)
+        cdp.send("Page.navigate", {"url": link}, sid)
+        print("  加载 JD 页面...")
+
+        page_state = {}
+        for _ in range(13):
+            page_state = _parse_send_page_state(cdp, sid, CONTACT_BUTTON_STATE_JS)
+            _raise_on_risk_markers(page_state, "JD 页")
+            if page_state.get("buttons"):
+                break
+            time.sleep(2.0)
+        if not page_state.get("buttons"):
+            status = page_state.get("status") or "未知"
+            raise JobUnavailableError(
+                f"未找到「立即沟通/继续沟通」按钮（页面状态: {status}），未打开会话"
+            )
+        if page_state.get("status") == "已关闭":
+            raise JobUnavailableError("职位已关闭，跳过")
+
+        # 会话可能在弹窗（新 target）打开，也可能在当前页原地跳转/弹层；
+        # 已知 target 集合必须在点击前采集，否则会漏掉刚弹出的会话窗口。
+        known_ids = _snapshot_target_ids(cdp)
+        clicked_label = _click_contact_js(cdp, sid)
+        print(f"  已点击「{clicked_label or '沟通'}」按钮，等待打开会话...")
+        chat_tid, chat_sid = _open_chat_session(cdp, sid, known_ids)
+
+        # 弹窗可能被浏览器拦截：改用受信任的鼠标事件再点一次
+        if not chat_sid:
+            if _click_contact_trusted(cdp, sid):
+                print("  弹窗未自动打开，已用真实鼠标事件再次点击...")
+                chat_tid, chat_sid = _open_chat_session(cdp, sid, known_ids)
+
+        target_sid = chat_sid or sid
+        composer_state = wait_for_chat_composer(cdp, target_sid)
+        if not composer_state.get("has_input"):
+            raise JobUnavailableError("会话已打开但未找到消息输入框")
+        return target_sid, tid, sid, chat_tid, chat_sid
+    except BaseException:
+        for session_id in (chat_sid, sid):
+            if session_id:
+                try:
+                    cdp.send("Target.detachFromTarget", {"sessionId": session_id})
+                except (KeyError, websocket.WebSocketException, TimeoutError):
+                    log.debug("脱离投递会话 target 失败", exc_info=True)
+        for target_id in (chat_tid, tid):
+            if target_id:
+                try:
+                    cdp.send("Target.closeTarget", {"targetId": target_id})
+                except (KeyError, websocket.WebSocketException, TimeoutError):
+                    log.debug("关闭投递 target 失败", exc_info=True)
+        raise
+
+
+def send_one_job_link(cdp, link, content):
+    """Open one JD link, click 立即沟通/继续沟通, and send content exactly once.
+
+    The click triggers BOSS's own behavior of opening/switching to the
+    conversation; the message is typed into the rendered composer and sent
+    with a single Enter. Post-send visibility is checked once; a failed check
+    is reported but never triggers a resend.
+    """
+    target_sid = tid = sid = chat_tid = chat_sid = None
+    try:
+        target_sid, tid, sid, chat_tid, chat_sid = _open_job_chat(cdp, link)
+
+        cdp.eval_js(CLEAR_CHAT_COMPOSER_JS, target_sid)
+        composer_id = _focus_chat_composer(cdp, target_sid)
+        if not composer_id:
+            raise JobUnavailableError("会话已打开但无法聚焦消息输入框，未发送")
+        time.sleep(1.0)  # 等聊天 SPA 完成挂载，避免 Enter 监听尚未绑定
+
+        cdp.send("Input.insertText", {"text": content}, target_sid)
+        time.sleep(0.5)
+        if content not in _read_composer_text(cdp, target_sid):
+            # 仅重试输入（此时尚未发送任何消息），仍不自动重发
+            cdp.eval_js(CLEAR_CHAT_COMPOSER_JS, target_sid)
+            cdp.eval_js(FOCUS_COMPOSER_JS, target_sid)
+            cdp.send("Input.insertText", {"text": content}, target_sid)
+            time.sleep(0.5)
+        if content not in _read_composer_text(cdp, target_sid):
+            raise JobUnavailableError("文本未能写入消息输入框，未发送")
+
+        before_count = count_active_outgoing_text(cdp, target_sid, content)
+        _dispatch_enter(cdp, target_sid)
+        time.sleep(1.5)
+        composer_cleared = _read_composer_text(cdp, target_sid) == ""
+        # 只读验证：不关闭消息页，立即回读当前聊天历史最后一条文本，
+        # 确认是否就是刚发送的内容（count 仅作辅助证据，绝不自动重发）。
+        after_count = before_count
+        send_success = False
+        verified_row = None
+        for _ in range(8):
+            after_count = count_active_outgoing_text(cdp, target_sid, content)
+            last_row = _last_text_row(cdp, target_sid)
+            if last_row is not None and _readback_matches(last_row, content):
+                send_success = True
+                verified_row = last_row
+                break
+            time.sleep(1.0)
+        if not send_success:
+            last_row = _last_text_row(cdp, target_sid)
+            if last_row is not None and _readback_matches(last_row, content):
+                send_success = True
+                verified_row = last_row
+        time.sleep(2.0)  # 让 BOSS 完成落盘后再关闭会话窗口
+
+        return {
+            "mode": "send",
+            "job_link": link,
+            "message": content,
+            "submitted": True,
+            "send_success": send_success,
+            "verified_last_sender": _SENDER_MAP.get(
+                str((verified_row or {}).get("type") or ""), "unknown"),
+            "verified_last_text": str((verified_row or {}).get("text") or "")[:200],
+            "post_send_visible": after_count > before_count,
+            "composer_cleared_after_send": composer_cleared,
+            "sent_at": datetime.now().isoformat(),
+        }
+    finally:
+        for session_id in (chat_sid, sid):
+            if session_id:
+                try:
+                    cdp.send("Target.detachFromTarget", {"sessionId": session_id})
+                except (KeyError, websocket.WebSocketException, TimeoutError):
+                    log.debug("脱离投递会话 target 失败", exc_info=True)
+        for target_id in (chat_tid, tid):
+            if target_id:
+                try:
+                    cdp.send("Target.closeTarget", {"targetId": target_id})
+                except (KeyError, websocket.WebSocketException, TimeoutError):
+                    log.debug("关闭投递 target 失败", exc_info=True)
+
+def send_to_job_links(links, content, cdp_port=DEFAULT_CDP_PORT):
+    """Batch-deliver one exact text to every JD link via the contact button.
+
+    Serial and low-frequency with pacing. Per-job failures are skipped and
+    reported; BOSS risk-control markers abort the whole batch immediately.
+    """
+    content = str(content or "").strip()
+    if not content:
+        raise ValueError("--content 必须是非空的发送文案")
+    if len(content) > 500:
+        raise ValueError("--content 最多 500 个字符")
+    link_tokens = _normalize_job_links(links)
+
+    print("\n" + "=" * 64)
+    print("  投递模式（--mode send）预检")
+    print("=" * 64)
+    print(f"  待投递岗位: {len(link_tokens)} 个")
+    preview = content if len(content) <= 80 else content[:80] + "…"
+    print(f"  发送文案: {preview}")
+    print(f"  首个岗位: {link_tokens[0]}")
+    print("  5 秒后自动开始（全程无逐条确认；Ctrl+C 可在此之前取消）...")
+    for remaining in range(5, 0, -1):
+        print(f"    {remaining}...")
+        time.sleep(1)
+
+    results = []
+    cdp = CDPSession(cdp_port)
+    try:
+        for idx, link in enumerate(link_tokens, start=1):
+            job_id = job_id_from_link(link)
+            print(f"\n[{idx}/{len(link_tokens)}] {job_id or link}")
+            status = ""
+            try:
+                result = send_one_job_link(cdp, link, content)
+            except SendRiskControlError as exc:
+                status = "aborted"
+                results.append({
+                    "job_id": job_id, "job_link": link,
+                    "status": status, "message": str(exc),
+                })
+                print(f"  ⛔ {exc}")
+                print("  已检测到风控/异常，立即停止后续投递，不再处理剩余岗位。")
+                break
+            except SendJobUnavailableError as exc:
+                status = "skipped"
+                print(f"  ⏭ {exc}")
+                results.append({
+                    "job_id": job_id, "job_link": link,
+                    "status": status, "message": str(exc),
+                })
+            else:
+                status = "sent"
+                results.append({
+                    "job_id": job_id, "job_link": link,
+                    "status": status, **result,
+                })
+                visible = "通过" if result.get("post_send_visible") else "未确认"
+                verified = "成功" if result.get("send_success") else "失败（不会自动重发）"
+                print(f"  ✅ 已发送；回读校验: {verified}；页面可见校验: {visible}")
+            if idx < len(link_tokens):
+                gap = random.uniform(8, 15) if status == "sent" else random.uniform(4, 8)
+                print(f"  等待 {gap:.0f}s 后处理下一个...")
+                time.sleep(gap)
+    finally:
+        cdp.close()
+
+    sent_count = sum(1 for r in results if r.get("status") == "sent")
+    return {
+        "mode": "send",
+        "total": len(link_tokens),
+        "sent": sent_count,
+        "sent_verified": sum(1 for r in results if r.get("send_success")),
+        "skipped": sum(1 for r in results if r.get("status") == "skipped"),
+        "aborted": sum(1 for r in results if r.get("status") == "aborted"),
+        "results": results,
+        "sent_at": datetime.now().isoformat(),
+        "scope": "仅通过 --job_link 指定的岗位；串行低频；每岗位只发一次，失败不自动重试；检测到风控立即停止",
+    }
+
+
+def _normalize_job_links(links):
+    """Split and validate a comma-separated --job_link list (send/read 共用)."""
+    link_tokens = [t.strip() for t in str(links or "").split(",") if t.strip()]
+    if not link_tokens:
+        raise ValueError("--job_link 必须提供至少一个 JD 链接")
+    for link in link_tokens:
+        parsed = urlparse(link)
+        if (
+            parsed.netloc not in {"www.zhipin.com", "zhipin.com"}
+            or not parsed.path.startswith("/job_detail/")
+        ):
+            raise ValueError(f"非法 JD 链接: {link}")
+    return link_tokens
+
+
+_SENDER_MAP = {
+    "outgoing_text": "self",
+    "incoming_text": "other",
+    "system_event": "system",
+    "platform_card": "platform",
+    "image_or_attachment": "attachment",
+}
+
+
+def _strip_boss_time_prefix(text):
+    """Strip BOSS's delivered-message prefix like '12:45 送达 ' or '送达 '.
+
+    Also accepts a leading date: 'YYYY-MM-DD HH:MM 送达 ' or 'MM-DD HH:MM 送达 '.
+    """
+    return re.sub(
+        r"^(?:(?:\d{4}-\d{2}-\d{2}|\d{2}-\d{2})\s+)?"
+        r"(?:\d{1,2}:\d{2}\s*)?\u9001\u8fbe\s*",
+        "", str(text or ""),
+    )
+
+
+def _build_messages(entries, max_entries):
+    """Normalize extracted chat rows into messages with sender/type and counts."""
+    if not isinstance(entries, list):
+        entries = []
+    messages = []
+    for index, item in enumerate(entries[:max_entries], start=1):
+        if not isinstance(item, dict):
+            continue
+        msg_type = str(item.get("type") or "unknown")
+        messages.append({
+            "index": index,
+            "sender": _SENDER_MAP.get(msg_type, "unknown"),
+            "type": msg_type,
+            "text": item.get("text") or "",
+            "image_count": item.get("image_count") or 0,
+            "link_count": item.get("link_count") or 0,
+            "class_hint": item.get("class_hint") or "",
+        })
+    type_counts = Counter(str(m["type"]) for m in messages)
+    sender_counts = Counter(str(m["sender"]) for m in messages)
+    return messages, dict(type_counts), dict(sender_counts)
+
+
+def _last_text_row(cdp, sid):
+    """Return the last rendered text message row (outgoing/incoming), or None."""
+    script = EXTRACT_ACTIVE_INBOX_JS.replace(
+        "__EXPECTED_CONTACT_JSON__", json.dumps("", ensure_ascii=False),
+    )
+    raw = cdp.eval_js(script, sid)
+    if not isinstance(raw, str):
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    entries = payload.get("rendered_entries") or []
+    for item in reversed(entries):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "") in ("outgoing_text", "incoming_text") \
+                and str(item.get("text") or "").strip():
+            return item
+    return None
+
+
+def _readback_matches(row, content):
+    """True when the read-back row is our content (after BOSS time prefix)."""
+    text = _strip_boss_time_prefix((row or {}).get("text") or "")
+    return bool(content) and content in text
+
+
+def _click_sidebar_conversation(cdp, sid, index):
+    """Click the sidebar conversation row at `index` (0-based) on the chat page.
+
+    BOSS's SPA ignores element.click() for switching conversations, so the
+    row center is located in the page and clicked with trusted mouse events.
+    """
+    script = CLICK_SIDEBAR_ITEM_JS.replace("__INDEX__", str(int(index)))
+    raw = cdp.eval_js(script, sid)
+    if not isinstance(raw, str):
+        raise RuntimeError("无法读取侧边栏会话列表")
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError("侧边栏会话点击结果格式异常") from exc
+    if not payload.get("ok"):
+        raise RuntimeError(
+            f"侧边栏会话序号 {index} 无效（当前共 {payload.get('count', 0)} 个）"
+        )
+    x = payload.get("x")
+    y = payload.get("y")
+    if not isinstance(x, int) or not isinstance(y, int):
+        raise RuntimeError("无法定位侧边栏会话的点击坐标")
+    for event_type in ("mousePressed", "mouseReleased"):
+        cdp.send("Input.dispatchMouseEvent", {
+            "type": event_type, "x": x, "y": y,
+            "button": "left", "clickCount": 1,
+        }, sid)
+    return int(payload.get("count", 0))
+
+
+def _chat_page_risk_check(cdp, sid, context="消息页"):
+    """Abort when the open chat page shows BOSS risk-control markers."""
+    state = _parse_send_page_state(cdp, sid, CHAT_COMPOSER_STATE_JS)
+    _raise_on_risk_markers(state, context)
+    return state
+
+
+def read_one_job_link(cdp, link, max_entries=200, result_mode="read"):
+    """Open one JD's conversation and return its currently rendered chat rows.
+
+    Each message row carries `sender`: "self"（自己发送）/ "other"（对方发送），
+    以及 "system"/"platform"/"attachment"/"unknown" 等非文本行。只读取当前
+    已渲染的历史；不滚动加载更早记录、不发送任何消息。
+    """
+    max_entries = max(1, min(200, int(max_entries)))
+    target_sid = tid = sid = chat_tid = chat_sid = None
+    try:
+        target_sid, tid, sid, chat_tid, chat_sid = _open_job_chat(cdp, link)
+        time.sleep(2.0)  # 等待消息区完成渲染
+        chat_state = _parse_send_page_state(cdp, target_sid, CHAT_COMPOSER_STATE_JS)
+        _raise_on_risk_markers(chat_state, "会话页")
+        conversation_url = chat_state.get("url") or link
+
+        script = EXTRACT_ACTIVE_INBOX_JS.replace(
+            "__EXPECTED_CONTACT_JSON__", json.dumps("", ensure_ascii=False),
+        )
+        raw = cdp.eval_js(script, target_sid)
+        if not isinstance(raw, str):
+            raise RuntimeError("未能从会话页读取已渲染内容")
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError("会话页返回的内容格式异常") from exc
+        entries = payload.get("rendered_entries") or []
+        messages, type_counts, sender_counts = _build_messages(entries, max_entries)
+        return {
+            "mode": result_mode,
+            "job_link": link,
+            "conversation_url": conversation_url,
+            "rendered_message_count": len(messages),
+            "message_type_counts": dict(type_counts),
+            "sender_counts": dict(sender_counts),
+            "messages": messages,
+            "scope": "打开 JD → 立即沟通/继续沟通 → 只读当前已渲染会话历史；不滚动更早记录、不发送消息",
+            "read_at": datetime.now().isoformat(),
+        }
+    finally:
+        for session_id in (chat_sid, sid):
+            if session_id:
+                try:
+                    cdp.send("Target.detachFromTarget", {"sessionId": session_id})
+                except (KeyError, websocket.WebSocketException, TimeoutError):
+                    log.debug("脱离投递会话 target 失败", exc_info=True)
+        for target_id in (chat_tid, tid):
+            if target_id:
+                try:
+                    cdp.send("Target.closeTarget", {"targetId": target_id})
+                except (KeyError, websocket.WebSocketException, TimeoutError):
+                    log.debug("关闭投递 target 失败", exc_info=True)
+
+
+def read_job_links(links, cdp_port=DEFAULT_CDP_PORT, max_entries=200,
+                  result_mode="read"):
+    """Open each JD's conversation and read the currently rendered chat rows.
+
+    Serial and low-frequency. Per-job failures are skipped and reported;
+    BOSS risk-control markers abort the whole batch immediately. This is a
+    read-only operation: it never types or sends a message.
+    """
+    link_tokens = _normalize_job_links(links)
+    max_entries = max(1, min(200, int(max_entries)))
+
+    print("\n" + "=" * 64)
+    print("  读取模式（--mode read）预检")
+    print("=" * 64)
+    print(f"  待读取岗位: {len(link_tokens)} 个")
+    print(f"  首个岗位: {link_tokens[0]}")
+    print("  只读当前已渲染的会话历史；不会发送任何消息。")
+
+    results = []
+    cdp = CDPSession(cdp_port)
+    try:
+        for idx, link in enumerate(link_tokens, start=1):
+            job_id = job_id_from_link(link)
+            print(f"\n[{idx}/{len(link_tokens)}] {job_id or link}")
+            status = ""
+            try:
+                result = read_one_job_link(
+                    cdp, link, max_entries=max_entries, result_mode=result_mode,
+                )
+            except RiskControlError as exc:
+                status = "aborted"
+                results.append({
+                    "job_id": job_id, "job_link": link,
+                    "status": status, "message": str(exc),
+                })
+                print(f"  ⛔ {exc}")
+                print("  已检测到风控/异常，立即停止后续读取，不再处理剩余岗位。")
+                break
+            except JobUnavailableError as exc:
+                status = "skipped"
+                print(f"  ⏭ {exc}")
+                results.append({
+                    "job_id": job_id, "job_link": link,
+                    "status": status, "message": str(exc),
+                })
+            else:
+                status = "read"
+                results.append({
+                    "job_id": job_id, "job_link": link,
+                    "status": status, **result,
+                })
+                print(f"  📖 已读取 {result.get('rendered_message_count', 0)} 条已渲染消息")
+            if idx < len(link_tokens):
+                gap = random.uniform(3, 6)
+                print(f"  等待 {gap:.0f}s 后处理下一个...")
+                time.sleep(gap)
+    finally:
+        cdp.close()
+
+    return {
+        "mode": result_mode,
+        "total": len(link_tokens),
+        "read": sum(1 for r in results if r.get("status") == "read"),
+        "skipped": sum(1 for r in results if r.get("status") == "skipped"),
+        "aborted": sum(1 for r in results if r.get("status") == "aborted"),
+        "results": results,
+        "read_at": datetime.now().isoformat(),
+        "scope": "仅通过 --job_link 指定岗位；只读当前已渲染会话历史；不滚动更早记录、不发送消息；检测到风控立即停止",
+    }
 
 
 def read_active_inbox_conversation(expected_contact, cdp_port=DEFAULT_CDP_PORT,
@@ -2192,6 +3105,513 @@ def read_active_inbox_conversation(expected_contact, cdp_port=DEFAULT_CDP_PORT,
             log.debug("关闭活动收件箱 CDP 连接失败", exc_info=True)
 
 
+def _last_message_info(item):
+    """Derive last-message sender and read state from BOSS's native item.
+
+    The conversation has exactly two participants: the current user and the
+    recruiter (`uid`). When the last message's `fromId` equals `uid` it was
+    sent by the recruiter ("other"); otherwise it was sent by the user
+    ("self"). Native status: 2 = 已读, 1 = 送达(未读), 0 = 未读.
+    """
+    lmi = item.get("lastMessageInfo") or {}
+    if not isinstance(lmi, dict):
+        lmi = {}
+    uid = item.get("uid")
+    from_id = lmi.get("fromId")
+    if from_id is not None and uid is not None:
+        sender = "other" if str(from_id) == str(uid) else "self"
+    else:
+        sender = "unknown"
+    try:
+        status = int(lmi.get("status"))
+    except (TypeError, ValueError):
+        status = None
+    if status == 2:
+        read_state = "已读"
+    elif status == 1:
+        read_state = "送达"
+    elif status == 0:
+        read_state = "未读"
+    else:
+        read_state = "未知"
+    return {
+        "sender": sender,
+        "read_state": read_state,
+        "native_status": status,
+        "text": str(lmi.get("showText") or item.get("lastMsg") or "")[:200],
+        "msg_time": lmi.get("msgTime"),
+    }
+
+
+def _match_sidebar_index(native_items, sidebar_rows, job_id):
+    """Map a job_id to the rendered sidebar row index (0-based).
+
+    BOSS's native list can include filtered rows that are not rendered in the
+    sidebar, so alignment is attempted by recruiter name + company first and
+    falls back to the positional order of non-filtered items.
+    """
+    active = [it for it in native_items if not it.get("filtered")]
+    # 位置回退仅当侧边栏渲染了全部非过滤项时安全；若 BOSS 隐藏了某个会话
+    # （如 relationType=5 未渲染到侧边栏），逐位对齐会点错人，必须禁用回退。
+    positional_safe = len(active) == len(sidebar_rows)
+    for item in active:
+        item_job_id = (item.get("encryptJobId") or item.get("job_id") or "")
+        if str(item_job_id) != str(job_id or ""):
+            continue
+        item_name = item.get("name") or item.get("recruiter_name") or ""
+        item_company = item.get("brandName") or item.get("company") or ""
+        key = (item_name + "|" + item_company).strip("|")
+        if key:
+            for row in sidebar_rows:
+                row_key = ((row.get("name") or "") + "|"
+                           + (row.get("company") or "")).strip("|")
+                if row_key and row_key == key:
+                    return int(row.get("index"))
+        if positional_safe:
+            pos = active.index(item)
+            if pos < len(sidebar_rows):
+                return int(sidebar_rows[pos].get("index"))
+    return None
+
+
+def list_chat_conversations(inbox_url=DEFAULT_INBOX_URL, cdp_port=DEFAULT_CDP_PORT):
+    """Return every sidebar conversation with structured fields.
+
+    Merges BOSS's native conversation-list response (avatar, name, company,
+    title, job_link, unread count, last-message text/sender/read state) with
+    the rendered sidebar rows (read/delivered status, selected state, row
+    index). Read-only: never sends, never switches the conversation.
+    """
+    parsed = urlparse(inbox_url)
+    if parsed.scheme != "https" or parsed.netloc not in {"www.zhipin.com", "zhipin.com"}:
+        raise ValueError("--inbox-url 必须是 https://www.zhipin.com/ 下的地址")
+
+    cdp = CDPSession(cdp_port)
+    tid = sid = None
+    try:
+        tid, sid = create_page_session(cdp)
+        cdp.send("Network.enable", {}, sid)
+        incr_request()
+        cdp.send("Page.navigate", {"url": inbox_url}, sid)
+        native = wait_for_native_inbox_list(cdp, sid, timeout=20, normalized=False)
+        _chat_page_risk_check(cdp, sid, "消息页")
+        time.sleep(2.0)  # 等侧边栏完成渲染
+        raw = cdp.eval_js(EXTRACT_SIDEBAR_CONVERSATIONS_JS, sid)
+        sidebar = json.loads(raw) if isinstance(raw, str) else []
+        if not isinstance(sidebar, list):
+            sidebar = []
+    finally:
+        try:
+            cdp.send("Target.closeTarget", {"targetId": tid})
+        except (KeyError, websocket.WebSocketException, TimeoutError):
+            log.debug("关闭会话列表 target 失败", exc_info=True)
+        try:
+            cdp.close()
+        except websocket.WebSocketException:
+            log.debug("关闭会话列表 CDP 连接失败", exc_info=True)
+
+    rows = []
+    used = set()
+    for item in native:
+        if item.get("filtered"):
+            continue
+        name = item.get("name") or ""
+        key = (name + "|" + (item.get("brandName") or "")).strip("|")
+        side = None
+        if key:
+            for s in sidebar:
+                s_key = ((s.get("name") or "") + "|"
+                         + (s.get("company") or "")).strip("|")
+                if s_key == key and id(s) not in used:
+                    side = s
+                    used.add(id(s))
+                    break
+        if side is None and name:
+            # 公司名可能因渲染差异不同：退化为仅按招聘者姓名匹配
+            for s in sidebar:
+                if (s.get("name") or "") == name and id(s) not in used:
+                    side = s
+                    used.add(id(s))
+                    break
+        security_id = item.get("securityId") or ""
+        encrypt_job_id = item.get("encryptJobId") or ""
+        job_link = ""
+        if encrypt_job_id:
+            job_link = "https://www.zhipin.com/job_detail/" + str(encrypt_job_id) + ".html"
+            if security_id:
+                job_link = build_detail_url({
+                    "job_link": job_link, "security_id": security_id,
+                })
+        lmi = _last_message_info(item)
+        row = {
+            "index": int(side["index"]) if side and "index" in side else None,
+            "rendered": bool(side),
+            "selected": bool(side and side.get("selected")),
+            "conversation_id": item.get("encryptUid") or item.get("encryptBossId") or "",
+            "recruiter_name": (side or {}).get("name") or item.get("name") or "",
+            "recruiter_avatar": (side or {}).get("avatar") or item.get("avatar") or "",
+            "recruiter_title": (side or {}).get("title") or item.get("title") or "",
+            "company": (side or {}).get("company") or item.get("brandName") or "",
+            "job_id": encrypt_job_id,
+            "job_title": item.get("sourceTitle") or item.get("jobName") or "",
+            "job_link": job_link,
+            "read_status": ((side or {}).get("read_status")) or (
+                "未读" if (item.get("unreadMsgCount") or 0) > 0 else "未知"),
+            "last_time": (side or {}).get("last_time") or item.get("lastTime") or "",
+            "last_timestamp": item.get("lastTS") or "",
+            "last_message_preview": (side or {}).get("last_message_preview") or "",
+            "last_message_sender": lmi["sender"],
+            "last_message_read": lmi["read_state"],
+            "last_message_native_status": lmi["native_status"],
+            "last_message_text": lmi["text"],
+            "last_message_time": lmi["msg_time"],
+            "unread_count": item.get("unreadMsgCount") or 0,
+            "is_top": bool(item.get("isTop")),
+            "chat_status": item.get("chatStatus") or "",
+            "relation_type": item.get("relationType") or "",
+        }
+        rows.append(row)
+    rows.sort(key=lambda r: (r["index"] is None, r["index"] if r["index"] is not None else 0))
+    unread_total = sum(
+        r["unread_count"] for r in rows if isinstance(r["unread_count"], int)
+    )
+    return {
+        "mode": "read-list",
+        "inbox_url": inbox_url,
+        "conversation_total": len(rows),
+        "unread_total": unread_total,
+        "conversations": rows,
+        "scope": "侧边栏会话完整结构化：头像/名称/公司/职位/job_link/已读或送达状态/最后消息(发送者、已读状态、文本、时间)/未读数/置顶；index 为侧边栏序号，可直接用于 --mode read --chat --switch-index；只读不发送",
+        "listed_at": datetime.now().isoformat(),
+    }
+
+
+def read_open_chat_conversation(expected_contact=None, cdp_port=DEFAULT_CDP_PORT,
+                                max_entries=80):
+    """Read only the currently rendered, user-selected open chat conversation.
+
+    Attaches to the already-open dedicated chat page without navigating it.
+    When `expected_contact` is given, verifies the name in the main header
+    before reading (same guard as inbox-read-active); otherwise reads whatever
+    conversation is currently selected (read-only).
+    """
+    max_entries = max(1, min(200, int(max_entries)))
+    cdp = CDPSession(cdp_port)
+    tid = sid = None
+    try:
+        tid, sid = attach_active_inbox_target(cdp)
+        _chat_page_risk_check(cdp, sid, "会话页")
+        script = EXTRACT_ACTIVE_INBOX_JS.replace(
+            "__EXPECTED_CONTACT_JSON__",
+            json.dumps(str(expected_contact or ""), ensure_ascii=False),
+        )
+        raw = cdp.eval_js(script, sid)
+        if not isinstance(raw, str):
+            raise RuntimeError("未能从当前消息页读取可见会话内容")
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError("当前消息页返回的会话内容格式异常") from exc
+        if expected_contact and str(expected_contact).strip() \
+                and not payload.get("expected_contact_in_active_header"):
+            raise RuntimeError(
+                f"主消息区标题未显示“{expected_contact}”；为避免读取错误对象，已停止"
+            )
+        entries = payload.get("rendered_entries") or []
+        messages, type_counts, sender_counts = _build_messages(entries, max_entries)
+        return {
+            "mode": "read-chat",
+            "scope": "仅当前已选会话、仅页面已渲染内容；未切换、未滚动、未发送",
+            "active_header": payload.get("active_header"),
+            "rendered_message_count": len(messages),
+            "message_type_counts": type_counts,
+            "sender_counts": sender_counts,
+            "messages": messages,
+            "composer_controls": payload.get("composer_controls") or [],
+            "scraped_at": datetime.now().isoformat(),
+        }
+    finally:
+        if tid is not None:
+            try:
+                cdp.send("Target.detachFromTarget", {"sessionId": sid})
+            except (KeyError, websocket.WebSocketException, TimeoutError):
+                log.debug("脱离活动收件箱 target 失败", exc_info=True)
+        try:
+            cdp.close()
+        except websocket.WebSocketException:
+            log.debug("关闭活动收件箱 CDP 连接失败", exc_info=True)
+
+
+def switch_and_read_conversations(indices, cdp_port=DEFAULT_CDP_PORT, max_entries=80):
+    """On the open chat page, click sidebar conversations and read each history.
+
+    Unlike `--job_link` reads, this never reopens the conversation: it clicks
+    the already rendered sidebar rows directly. Read-only after the click; an
+    unread conversation may become read.
+    """
+    index_tokens = []
+    for token in str(indices or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            index_tokens.append(int(token))
+        except ValueError:
+            raise ValueError(f"非法的会话序号: {token}")
+    if not index_tokens:
+        raise ValueError("--switch-index 必须提供至少一个会话序号（0 起）")
+    if any(i < 0 for i in index_tokens):
+        raise ValueError("--switch-index 序号不能为负")
+    max_entries = max(1, min(200, int(max_entries)))
+
+    print("\n" + "=" * 64)
+    print("  读取模式（--mode read --chat --switch-index）预检")
+    print("=" * 64)
+    print(f"  待切换会话: {len(index_tokens)} 个（0 起侧边栏序号）")
+    print("  直接在已打开的消息页点击侧边栏切换；不通过 job_link 重新打开会话。")
+
+    cdp = CDPSession(cdp_port)
+    tid = sid = None
+    results = []
+    try:
+        tid, sid = attach_active_inbox_target(cdp)
+        _chat_page_risk_check(cdp, sid, "会话页")
+        for pos, index in enumerate(index_tokens, start=1):
+            print(f"\n[{pos}/{len(index_tokens)}] 切换侧边栏会话 #{index}")
+            status = ""
+            try:
+                _click_sidebar_conversation(cdp, sid, index)
+                time.sleep(2.0)
+                script = EXTRACT_ACTIVE_INBOX_JS.replace(
+                    "__EXPECTED_CONTACT_JSON__", json.dumps("", ensure_ascii=False),
+                )
+                raw = cdp.eval_js(script, sid)
+                payload = {}
+                if isinstance(raw, str):
+                    try:
+                        payload = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        payload = {}
+                entries = payload.get("rendered_entries") or []
+                messages, type_counts, sender_counts = _build_messages(entries, max_entries)
+                status = "read"
+                results.append({
+                    "switch_index": index,
+                    "status": status,
+                    "active_header": payload.get("active_header"),
+                    "rendered_message_count": len(messages),
+                    "message_type_counts": type_counts,
+                    "sender_counts": sender_counts,
+                    "messages": messages,
+                })
+                print(f"  📖 已读取 {len(messages)} 条已渲染消息")
+            except (RuntimeError, ValueError) as exc:
+                status = "skipped"
+                results.append({
+                    "switch_index": index, "status": status, "message": str(exc),
+                })
+                print(f"  ⏭ {exc}")
+            if pos < len(index_tokens):
+                gap = random.uniform(3, 6)
+                print(f"  等待 {gap:.0f}s 后处理下一个...")
+                time.sleep(gap)
+    finally:
+        if tid is not None:
+            try:
+                cdp.send("Target.detachFromTarget", {"sessionId": sid})
+            except (KeyError, websocket.WebSocketException, TimeoutError):
+                log.debug("脱离切换读取 target 失败", exc_info=True)
+        try:
+            cdp.close()
+        except websocket.WebSocketException:
+            log.debug("关闭切换读取 CDP 连接失败", exc_info=True)
+
+    return {
+        "mode": "read-chat-switch",
+        "total": len(index_tokens),
+        "read": sum(1 for r in results if r.get("status") == "read"),
+        "skipped": sum(1 for r in results if r.get("status") == "skipped"),
+        "results": results,
+        "scope": "在已打开的消息页直接点击侧边栏切换会话后只读当前已渲染历史；不发送、不滚动更早记录；读取未读会话可能将其标记为已读",
+        "read_at": datetime.now().isoformat(),
+    }
+
+
+def _capture_native_items_temp(cdp, timeout=20):
+    """Capture raw native conversation items from a fresh hidden navigation.
+
+    The user's open chat page is NOT reloaded: BOSS's SPA sometimes restores
+    from bfcache on reload without re-requesting the friend list, which makes
+    ``Page.reload`` unreliable. A fresh background target always performs a
+    full document load and reliably emits getGeekFriendList.json, matching the
+    ``--mode read --list`` pattern. Read-only; the temp target is closed after
+    capture.
+    """
+    temp_tid = temp_sid = None
+    try:
+        temp_tid, temp_sid = create_page_session(cdp, background=True)
+        cdp.send("Network.enable", {}, temp_sid)
+        incr_request()
+        cdp.send("Page.navigate", {"url": DEFAULT_INBOX_URL}, temp_sid)
+        items = wait_for_native_inbox_list(
+            cdp, temp_sid, timeout=timeout, normalized=False,
+        )
+        _chat_page_risk_check(cdp, temp_sid, "消息页")
+        return items
+    finally:
+        if temp_tid is not None:
+            try:
+                cdp.send("Target.closeTarget", {"targetId": temp_tid})
+            except (KeyError, websocket.WebSocketException, TimeoutError):
+                log.debug("关闭临时会话列表 target 失败", exc_info=True)
+
+
+def _read_chat_payload(cdp, sid):
+    """Extract the rendered chat payload from the active pane (dict or {})."""
+    script = EXTRACT_ACTIVE_INBOX_JS.replace(
+        "__EXPECTED_CONTACT_JSON__", json.dumps("", ensure_ascii=False),
+    )
+    raw = cdp.eval_js(script, sid)
+    if not isinstance(raw, str):
+        return {}
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _read_one_chat_prefer_sidebar(cdp, link, job_id, max_entries):
+    """Try switching on the open chat page first; fall back to opening the JD.
+
+    Returns (result_dict, entered_via): entered_via is "sidebar" when the
+    conversation was switched directly on the already-open chat page, and
+    "job_link" when the fallback path opened the JD's contact conversation.
+    """
+    tid = sid = None
+    try:
+        tid, sid = attach_active_inbox_target(cdp)
+    except RuntimeError:
+        tid = sid = None
+    if sid is not None:
+        try:
+            _chat_page_risk_check(cdp, sid, "会话页")
+            items = _capture_native_items_temp(cdp)
+            raw = cdp.eval_js(EXTRACT_SIDEBAR_CONVERSATIONS_JS, sid)
+            sidebar = json.loads(raw) if isinstance(raw, str) else []
+            if not isinstance(sidebar, list):
+                sidebar = []
+            index = _match_sidebar_index(items, sidebar, job_id)
+            if index is not None:
+                _click_sidebar_conversation(cdp, sid, index)
+                time.sleep(2.0)
+                payload = _read_chat_payload(cdp, sid)
+                entries = payload.get("rendered_entries") or []
+                messages, type_counts, sender_counts = _build_messages(
+                    entries, max_entries)
+                if messages:
+                    return {
+                        "mode": "read-chat",
+                        "job_link": link,
+                        "switch_index": index,
+                        "conversation_url": "https://www.zhipin.com/web/geek/chat",
+                        "rendered_message_count": len(messages),
+                        "message_type_counts": dict(type_counts),
+                        "sender_counts": dict(sender_counts),
+                        "messages": messages,
+                        "scope": "消息页已打开：直接点击侧边栏切换会话后读取；切换/匹配失败回退 job_link",
+                        "read_at": datetime.now().isoformat(),
+                    }, "sidebar"
+        except (RiskControlError, JobUnavailableError, RuntimeError,
+                TimeoutError, ValueError):
+            log.debug("侧边栏切换会话失败，回退 job_link", exc_info=True)
+        finally:
+            if tid is not None:
+                try:
+                    cdp.send("Target.detachFromTarget", {"sessionId": sid})
+                except (KeyError, websocket.WebSocketException, TimeoutError):
+                    log.debug("脱离消息页 target 失败", exc_info=True)
+    result = read_one_job_link(
+        cdp, link, max_entries=max_entries, result_mode="read-chat",
+    )
+    return result, "job_link"
+
+
+def read_chat_switch_or_open(links, cdp_port=DEFAULT_CDP_PORT, max_entries=200):
+    """Read conversations by job_link, preferring an already open chat page.
+
+    For each `--job_link`: when the dedicated chat page is already open, the
+    matching sidebar conversation is located (native list + rendered rows) and
+    switched to with trusted mouse events, then the history is read. If the
+    chat page is not open, the job is not in the sidebar, or switching fails,
+    fall back to opening the job_link and entering the conversation through
+    BOSS's 立即沟通/继续沟通 button. Serial and low-frequency.
+    """
+    link_tokens = _normalize_job_links(links)
+    max_entries = max(1, min(200, int(max_entries)))
+
+    print("\n" + "=" * 64)
+    print("  读取模式（--mode read --chat --job_link）预检")
+    print("=" * 64)
+    print(f"  待读取岗位: {len(link_tokens)} 个")
+    print("  消息页已打开时优先在侧边栏直接切换；切换失败回退 job_link 进入。")
+
+    results = []
+    cdp = CDPSession(cdp_port)
+    try:
+        for idx, link in enumerate(link_tokens, start=1):
+            job_id = job_id_from_link(link)
+            print(f"\n[{idx}/{len(link_tokens)}] {job_id or link}")
+            status = ""
+            try:
+                result, via = _read_one_chat_prefer_sidebar(
+                    cdp, link, job_id, max_entries)
+            except RiskControlError as exc:
+                status = "aborted"
+                results.append({
+                    "job_id": job_id, "job_link": link,
+                    "status": status, "message": str(exc),
+                })
+                print(f"  ⛔ {exc}")
+                print("  已检测到风控/异常，立即停止后续读取，不再处理剩余岗位。")
+                break
+            except JobUnavailableError as exc:
+                status = "skipped"
+                print(f"  ⏭ {exc}")
+                results.append({
+                    "job_id": job_id, "job_link": link,
+                    "status": status, "message": str(exc),
+                })
+            else:
+                status = "read"
+                result["entered_via"] = via
+                results.append({
+                    "job_id": job_id, "job_link": link,
+                    "status": status, **result,
+                })
+                via_label = "侧边栏切换" if via == "sidebar" else "job_link"
+                print(f"  📖 已读取 {result.get('rendered_message_count', 0)} 条（入口: {via_label}）")
+            if idx < len(link_tokens):
+                gap = random.uniform(3, 6)
+                print(f"  等待 {gap:.0f}s 后处理下一个...")
+                time.sleep(gap)
+    finally:
+        cdp.close()
+
+    return {
+        "mode": "read-chat",
+        "total": len(link_tokens),
+        "read": sum(1 for r in results if r.get("status") == "read"),
+        "skipped": sum(1 for r in results if r.get("status") == "skipped"),
+        "aborted": sum(1 for r in results if r.get("status") == "aborted"),
+        "via_sidebar": sum(1 for r in results if r.get("entered_via") == "sidebar"),
+        "via_job_link": sum(1 for r in results if r.get("entered_via") == "job_link"),
+        "results": results,
+        "read_at": datetime.now().isoformat(),
+        "scope": "消息页已打开时优先点击侧边栏切换会话（真实鼠标事件）后只读当前已渲染历史；切换失败或无消息页时回退打开 job_link 进入；不发送、不滚动更早记录",
+    }
+
+
 # ============================================================
 # 抓取详情
 # ============================================================
@@ -2204,6 +3624,10 @@ def build_detail_record(job, extracted):
     return {
         "job_id": job.get("job_id", ""),
         "title": job.get("title") or extracted.get("title", ""),
+        "job_status": normalize_job_status(
+            job.get("job_status") or extracted.get("job_status", "")
+        ),
+        "contact_available": bool(extracted.get("contact_available")),
         "company": job.get("boss_name") or extracted.get("company", ""),
         "salary": job.get("salary") or extracted.get("salary", ""),
         "salary_source": job.get("salary_source") or (
@@ -2904,6 +4328,19 @@ def main():
   # 仅在用户当次精确确认后，向当前已选会话发送一条文本
   %(prog)s --mode inbox-send-active --expect-contact "杨先生" --message "你好" --confirm-send --stdout
 
+  # 批量投递：直接打开 JD → 点击 立即沟通/继续沟通 → 自动发送 --content
+  %(prog)s --mode send --content "您好，我对该岗位很感兴趣，这是我的简历..." --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout
+  # 读取 JD 对应会话的当前聊天历史（区分 对方/自己 发送；只读不发送）
+  %(prog)s --mode read --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout
+  # 列出侧边栏所有会话完整字段（名称/头像/公司/job_link/已读或送达/最后消息发送者与已读状态/未读数等）
+  %(prog)s --mode read --list --stdout
+  # 直接读取当前已打开消息页面的选中会话（不切换/不重新打开）
+  %(prog)s --mode read --chat --stdout
+  # 在当前消息页直接点击侧边栏序号切换会话后读取（无需 job_link 重新打开）
+  %(prog)s --mode read --chat --switch-index 0,1 --stdout
+  # 消息页已打开时优先在侧边栏切换会话再读取；切换失败回退打开 job_link 进入
+  %(prog)s --mode read --chat --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout
+
   # 文件模式 + CSV 导出（不配 --stdout 时写文件）
   %(prog)s --mode search --keyword "agent开发" --city 北京 --pages 3 --format csv
 
@@ -2930,12 +4367,20 @@ def main():
                    help="homepage/inbox 模式捕获原生响应的秒数（5-30，默认 15）")
     p.add_argument("--expect-contact", default=None,
                    help="inbox-read-active 的当前会话校验联系人姓名（必填）")
-    p.add_argument("--max-chat-items", type=int, default=80,
-                   help="inbox-read-active 最多输出的当前已渲染消息项（1-200，默认 80）")
+    p.add_argument("--max-chat-items", type=int, default=None,
+                   help="inbox-read-active / read 模式最多输出的当前已渲染消息项（1-200；inbox-read-active 默认 80，read 默认 200）")
+    p.add_argument("--list", action="store_true",
+                   help="read 模式：列出侧边栏所有会话（名称/头像/公司/职位/job_link/已读或送达状态/最后消息的发送者与已读状态/文本/时间/未读数/置顶/侧边栏序号）")
+    p.add_argument("--chat", action="store_true",
+                   help="read 模式：读取聊天。无附加参数=读当前已打开消息页面的选中会话；配 --job_link=消息页已打开时先在侧边栏切换、切换失败或未打开才回退打开 JD；配 --switch-index=直接点击侧边栏会话序号切换")
+    p.add_argument("--switch-index", default=None,
+                   help="read --chat 模式：直接点击侧边栏会话序号（0 起，逗号分隔）切换并读取，无需通过 job_link 重新打开会话")
     p.add_argument("--message", default=None,
                    help="inbox-send-active 的精确发送文本")
     p.add_argument("--confirm-send", action="store_true",
                    help="确认执行 inbox-send-active 的单次外部发送；缺失则拒绝发送")
+    p.add_argument("--content", default=None,
+                   help="send 模式的精确发送文案（必填，最多 500 字符）")
     p.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT,
                    help=f"CDP 调试端口 (默认 {DEFAULT_CDP_PORT})")
     p.add_argument("--format", default="json", choices=["json", "csv"],
@@ -2953,9 +4398,9 @@ def main():
     p.add_argument("--job_id", dest="job_ids", default=None,
                    help="按 job_id 精选详情（逗号分隔；需列表来源：管道/自动加载最新）")
     p.add_argument("--job_link", dest="job_links", default=None,
-                   help="按完整 job_link 精选详情（逗号分隔；含 lid/securityId，无需列表文件）")
-    p.add_argument("--mode", choices=["search", "detail", "homepage", "inbox", "inbox-discover", "inbox-read-active", "inbox-send-active"], default="search",
-                   help="功能模式：search=多条件检索；detail=精选详情；homepage=首页推荐/最新职位；inbox=收件箱进度；inbox-discover=只读发现接口；inbox-read-active=读取当前已选会话；inbox-send-active=单次确认发送")
+                   help="按完整 job_link 精选详情 / send 投递 / read 读取目标（逗号分隔；含 lid/securityId，无需列表文件）")
+    p.add_argument("--mode", choices=["search", "detail", "homepage", "inbox", "inbox-discover", "inbox-read-active", "inbox-send-active", "send", "read"], default="search",
+                   help="功能模式：search=多条件检索；detail=精选详情；homepage=首页推荐/最新职位；inbox=收件箱进度；inbox-discover=只读发现接口；inbox-read-active=读取当前已选会话；inbox-send-active=单次确认发送；send=打开 JD → 点击立即沟通/继续沟通 → 发送 --content；read=读取聊天（--list 列会话 / --chat 读当前选中会话 / --chat --job_link 从 JD 进入 / --chat --switch-index 直切侧边栏会话）")
     p.add_argument("--stdout", action="store_true",
                    help="结果 JSON 输出到 stdout（不写文件；日志走 stderr，可用 2>log.txt 分离）")
     p.add_argument("--stream-json", action="store_true",
@@ -3080,7 +4525,7 @@ def main():
             inbox_data = read_active_inbox_conversation(
                 args.expect_contact,
                 cdp_port=args.cdp_port,
-                max_entries=args.max_chat_items,
+                max_entries=args.max_chat_items if args.max_chat_items else 80,
             )
         except (TimeoutError, RuntimeError, ValueError) as exc:
             print(f"❌ 当前会话读取失败: {exc}")
@@ -3107,6 +4552,86 @@ def main():
         real_stdout.write("\n")
         real_stdout.flush()
         sys.exit(0)
+
+    if args.mode == "send":
+        link_tokens = [t.strip() for t in (args.job_links or "").split(",") if t.strip()]
+        if not link_tokens:
+            p.error("--mode send 必须通过 --job_link 提供至少一个 JD 链接")
+        if not args.content or not str(args.content).strip():
+            p.error("--mode send 必须提供非空的 --content 发送文案")
+        if len(str(args.content)) > 500:
+            p.error("--mode send 的 --content 最多 500 字符")
+        try:
+            send_data = send_to_job_links(
+                args.job_links, args.content, cdp_port=args.cdp_port,
+            )
+        except (SendRiskControlError, SendJobUnavailableError,
+                TimeoutError, RuntimeError, ValueError) as exc:
+            print(f"❌ 批量投递失败: {exc}")
+            sys.exit(2)
+        if args.stdout:
+            json.dump(send_data, real_stdout, ensure_ascii=False, indent=2)
+            real_stdout.write("\n")
+            real_stdout.flush()
+        else:
+            output_path = default_output_path("sends")
+            write_json_atomic(output_path, send_data)
+            print(f"\n投递记录已保存: {output_path}")
+        sys.exit(0)
+
+    if args.mode == "read":
+        if not args.stdout:
+            p.error("--mode read 只允许配合 --stdout 使用，避免将私聊正文写入默认文件")
+        max_entries = args.max_chat_items if args.max_chat_items else 200
+        try:
+            if args.list:
+                # 只读侧边栏所有会话摘要：名称/公司/job_link/已读或送达/最后消息时间
+                read_data = list_chat_conversations(
+                    args.inbox_url, cdp_port=args.cdp_port,
+                )
+            elif args.chat:
+                if args.switch_index:
+                    # 在当前已打开消息页直接点击侧边栏会话切换，无需 job_link 重新打开
+                    read_data = switch_and_read_conversations(
+                        args.switch_index,
+                        cdp_port=args.cdp_port,
+                        max_entries=80 if args.max_chat_items is None
+                        else args.max_chat_items,
+                    )
+                elif args.job_links:
+                    # 消息页已打开时优先切换会话，切换失败回退 job_link 进入
+                    read_data = read_chat_switch_or_open(
+                        args.job_links,
+                        cdp_port=args.cdp_port,
+                        max_entries=max_entries,
+                    )
+                else:
+                    # 读取当前已打开消息页面的选中会话（不切换/不重新打开）
+                    read_data = read_open_chat_conversation(
+                        expected_contact=args.expect_contact,
+                        cdp_port=args.cdp_port,
+                        max_entries=80 if args.max_chat_items is None
+                        else args.max_chat_items,
+                    )
+            else:
+                # 向后兼容：--mode read --job_link 直接读取
+                link_tokens = [t.strip() for t in (args.job_links or "").split(",") if t.strip()]
+                if not link_tokens:
+                    p.error("--mode read 必须通过 --job_link 提供至少一个 JD 链接，或改用 --list / --chat")
+                read_data = read_job_links(
+                    args.job_links,
+                    cdp_port=args.cdp_port,
+                    max_entries=max_entries,
+                )
+        except (RiskControlError, JobUnavailableError,
+                TimeoutError, RuntimeError, ValueError) as exc:
+            print(f"❌ 批量读取失败: {exc}")
+            sys.exit(2)
+        json.dump(read_data, real_stdout, ensure_ascii=False, indent=2)
+        real_stdout.write("\n")
+        real_stdout.flush()
+        sys.exit(0)
+
 
     # --mode detail: 列表来源 = 管道stdin / 自动加载最新 / --job_link 直接传链接
     if args.mode == "detail":

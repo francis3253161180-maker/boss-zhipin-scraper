@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.9（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.11（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.9.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.11.0-orange.svg)
 
 一个面向个人求职研究的低频职位工具：通过 Chrome DevTools Protocol 连接隔离的已登录 Chrome，导航到目标搜索页并捕获页面自身的 `joblist.json` 响应，输出含**明文薪资**的职位数据（JSON / CSV）。详情页串行抓取并支持流式 NDJSON 输出。
 
@@ -50,6 +50,19 @@ python3 scripts/boss_cdp_raw.py --mode inbox-read-active --expect-contact "刘�
 # 仅在该次已明确确认的前提下，向当前已打开会话发送一条精确文本
 python3 scripts/boss_cdp_raw.py --mode inbox-send-active --expect-contact "杨先生" --message "你好" --confirm-send --stdout
 
+# 批量投递：打开 JD → 点击 立即沟通/继续沟通 → 自动发送 --content（发送后自动回读校验并返回 send_success）
+python3 scripts/boss_cdp_raw.py --mode send --content "您好，我对该岗位很感兴趣，这是我的简历..." --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout
+# 读取 JD 对应会话的当前聊天历史（区分 对方/自己 发送；只读不发送，必须 --stdout）
+python3 scripts/boss_cdp_raw.py --mode read --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout
+# 列出消息页侧边栏所有会话（名称/公司/job_link/已读或送达/最后消息发送者与已读状态/头像/未读数等完整字段）
+python3 scripts/boss_cdp_raw.py --mode read --list --stdout
+# 读取当前已打开消息页面的选中会话（不切换、不重新打开）
+python3 scripts/boss_cdp_raw.py --mode read --chat --stdout
+# 消息页已打开时优先在侧边栏直接切换会话再读取；切换失败回退打开 job_link 进入
+python3 scripts/boss_cdp_raw.py --mode read --chat --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout
+# 在已打开的消息页直接点击侧边栏会话序号切换并读取（无需重新打开 job_link）
+python3 scripts/boss_cdp_raw.py --mode read --chat --switch-index 0,1 --stdout
+
 # 支持全国城市（含三四五线），例如：
 python3 scripts/boss_cdp_raw.py --keyword "前端" --city 赣州 --pages 3
 # 查看支持的城市：--list-cities [关键词]
@@ -68,6 +81,8 @@ python3 scripts/job_summary.py
 - 收件箱沟通进度读取：公司、关联岗位、未读数、最后活动时间（不读取聊天正文）；`inbox-discover` 可额外汇总 JSON/WebSocket 信封字段结构
 - 指定当前会话只读：`inbox-read-active` 在主消息区标题校验联系人后，仅提取页面已渲染的逻辑消息行及消息类型；不读取其它会话、不加载更早历史、不发送
 - 单次确认发送：`inbox-send-active` 必须同时提供当前会话联系人、精确文本和 `--confirm-send`；无搜索、无队列、无附件、无自动重试，发送后仅校验该文本是否出现在当前会话
+- 批量投递（`--mode send`）：打开 `--job_link` 指定的 JD → 点击「立即沟通/继续沟通」让 BOSS 自动打开并切换会话 → 发送精确 `--content`；发送后不关闭消息页，立即回读聊天历史最后一条做校验，返回 `send_success`/`verified_last_sender`/`verified_last_text`；串行低频、每岗位只发一次、失败不自动重试，检测到风控立即停止整个批次
+- 会话读取（`--mode read`）多形态：`--list` 合并原生会话列表与侧边栏 DOM，返回每个会话的名称/头像/公司/职位/job_link/已读或送达状态/最后一条消息（发送者 `self`/`other`、已读或送达状态、文本、时间）/未读数/是否置顶/是否选中/侧边栏序号等完整字段；`--chat` 读取当前已打开消息页面的选中会话；`--chat --job_link` 在消息页已打开时**优先点击侧边栏直接切换会话**，切换失败或未打开消息页才回退打开 job_link 进入（结果带 `entered_via: sidebar|job_link`，汇总含 `via_sidebar`/`via_job_link`）；`--chat --switch-index N` 在已打开的消息页用受信任鼠标事件直接点击侧边栏会话切换（无需 job_link 重新打开）。逐条区分 `self`/`other` 及系统/平台卡片/附件；不滚动更早记录、不发送、stdout-only 不落盘
 - Boss 活跃状态独立字段（`boss_active_status`）：列表兼容 `bossOnline`→「在线」，详情可得到「刚刚活跃」等更细状态
 - JSON / CSV 双格式输出
 - 详情页 JD 抓取 + 技能分析
@@ -85,6 +100,8 @@ python3 scripts/job_summary.py
 - `--check` 只检查依赖和 CDP，不访问 BOSS；真实目标搜索才是登录态和接口可用性的判断依据。
 - `--stdout` 在完成后输出一个完整 JSON 文档；`--stream-json`（仅 detail）每完成一个岗位输出一行 NDJSON。
 - `--job_link` 直链详情会从渲染页面补齐可见的标题、公司、薪资、地点、标签和公司链接；不存在的字段保持为空。
+- 投递模式（`--mode send`）逐条打开 JD 页面，点击「立即沟通/继续沟通」由 BOSS 自行打开并切换到对应会话，确认 `--content` 已写入输入框后，用受信任的 Enter 序列（rawKeyDown+char+keyUp）发送；发送后**不关闭消息页**，立即回读聊天历史最后一条，若与 `--content` 一致则 `send_success=true`，并附 `verified_last_sender`（self/other）与 `verified_last_text`（回读原文，截断 200 字符）；汇总层额外给出 `sent_verified` 计数。另有 `post_send_visible` 与 `composer_cleared_after_send` 字段；失败只报告、绝不自动重发；开始前有 5 秒预检倒计时可 Ctrl+C 取消，岗位之间 8–15 秒间隔，检测到风控提示立即停止剩余投递。
+- 读取模式（`--mode read`）支持三种形态：`--list` 合并原生会话列表与侧边栏 DOM，返回全部会话的 名称/头像/公司/职位/job_link/已读或送达状态/最后一条消息（`last_message_sender` 区分 `self`/`other`、`last_message_read` 区分 已读/送达/未读、`last_message_text`/`last_message_time`）/未读数/是否置顶/是否选中/侧边栏序号 `index`（可直接用于 `--chat --switch-index`）；`--chat` 只读当前已打开消息页面的选中会话；`--chat --job_link` 消息页已打开时先在侧边栏用受信任鼠标事件切换会话再读取，切换失败或无消息页才回退打开 JD 进入（`entered_via` 标记实际入口，汇总含 `via_sidebar`/`via_job_link`）；`--chat --switch-index 0,1` 在当前消息页直接点击侧边栏会话切换后读取（不通过 job_link 重新打开）。每条消息标注 `sender`（`self`/`other`/`system`/`platform`/`attachment`/`unknown`）；必须配 `--stdout`，不写聊天正文到磁盘，不发送、不自动滚动更早历史，检测到风控立即停止。
 - JSON 增量写盘使用临时文件原子替换，避免中断留下半截结果。
 - 等待采用自适应策略：分页间隔 8–15 秒，详情初始渲染 5–8 秒，仅在缺少“职位描述”时最多补两次短滚动，详情之间 8–15 秒，最后一个岗位不额外等待。
 
@@ -191,7 +208,13 @@ python3 scripts/job_summary.py --top 15
 | `--list-cities [关键词]` | 打印支持的城市列表，可选关键词过滤，如 `--list-cities 江` |
 | `--pages` | 页数（上限 10） |
 | `--format` | json / csv；csv 会同时导出列表和详情 CSV |
-| `--mode search/detail/homepage/inbox` | 列表搜索、精选详情、首页推荐/最新职位或收件箱沟通进度 |
+| `--mode search/detail/homepage/inbox/send/read` | 列表搜索、精选详情、首页推荐/最新职位、收件箱进度、批量投递或会话读取 |
+| `--content` | `send` 模式要发送的精确文案（必填，最多 500 字符） |
+| `--list` | `read` 模式：列出侧边栏所有会话摘要（名称/公司/job_link/已读或送达/时间） |
+| `--chat` | `read` 模式：读取聊天；无附加参数=读当前选中会话，配 `--job_link`=从 JD 进入，配 `--switch-index`=直切侧边栏会话 |
+| `--switch-index` | `read --chat` 模式：侧边栏会话序号（0 起，逗号分隔），直接点击切换，无需重新打开 job_link |
+| `--expect-contact` | `inbox-read-active` / `read --chat` 的当前会话联系人校验姓名 |
+| `--max-chat-items` | `inbox-read-active` / `read` 最多输出的已渲染消息条数（1–200） |
 | `--homepage-url` | `homepage` 模式目标首页地址 |
 | `--inbox-url` | `inbox` / `inbox-discover` 的目标收件箱地址 |
 | `--capture-seconds` | `homepage` / `inbox` 原生响应捕获窗口，5–30 秒 |

@@ -381,6 +381,25 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(detail["salary_source"], "api")
         self.assertEqual(detail["boss_active_status"], "今日活跃")
 
+    def test_detail_record_preserves_explicit_job_status(self):
+        module = load_module()
+        detail = module.build_detail_record(
+            {"job_id": "abc123", "job_link": "https://www.zhipin.com/job_detail/abc.html"},
+            {"job_status": "招聘中", "contact_available": True, "jd": "Build AI agents", "tags": []},
+        )
+
+        self.assertEqual(detail["job_status"], "招聘中")
+        self.assertTrue(detail["contact_available"])
+
+    def test_detail_record_marks_unknown_job_status_without_closing_it(self):
+        module = load_module()
+        detail = module.build_detail_record(
+            {"job_id": "abc123", "job_link": "https://www.zhipin.com/job_detail/abc.html"},
+            {"job_status": "仍可浏览", "jd": "Build AI agents", "tags": []},
+        )
+
+        self.assertEqual(detail["job_status"], "未显式标注")
+
     def test_detail_record_falls_back_to_list_active_status(self):
         module = load_module()
         job = {
@@ -480,8 +499,31 @@ class ChromeSetupTests(unittest.TestCase):
 
         self.assertEqual(fields["jd"], description)
         self.assertEqual(fields["boss_active_status"], "今日活跃")
+        self.assertEqual(fields["job_status"], "未显式标注")
         self.assertNotIn("今日活跃", fields["jd"])
         self.assertNotIn("张女士", fields["jd"])
+
+    def test_extract_detail_fields_preserves_explicit_open_and_closed_status(self):
+        module = load_module()
+        description = "负责 Agent 应用开发和离线评测。\n" * 8
+
+        open_fields = module.extract_detail_fields({
+            "jd": "职位描述\n" + description,
+            "job_status": "招聘中",
+        })
+        closed_fields = module.extract_detail_fields({
+            "jd": "职位描述\n" + description,
+            "job_status": "已关闭",
+        })
+
+        self.assertEqual(open_fields["job_status"], "招聘中")
+        self.assertEqual(closed_fields["job_status"], "已关闭")
+
+    def test_detail_status_extractor_covers_visible_closed_label(self):
+        module = load_module()
+
+        self.assertIn("职位已关闭", module.EXTRACT_DETAIL_JS)
+        self.assertIn("停止招聘", module.EXTRACT_DETAIL_JS)
 
     def test_extract_detail_fields_online_status(self):
         module = load_module()
@@ -1320,6 +1362,9 @@ class NativeFlowRegressionTests(unittest.TestCase):
         cdp.eval_js.side_effect = [
             json.dumps({"matches": [{"text": "杨先生｜Loopit", "top": 20, "left": 600}]}),
             0,
+            "你好",
+            "你好",
+            "",
             1,
         ]
         with mock.patch.object(module, "CDPSession", return_value=cdp), \
@@ -1331,7 +1376,7 @@ class NativeFlowRegressionTests(unittest.TestCase):
         cdp.send.assert_any_call("DOM.focus", {"nodeId": 2}, "chat-session")
         cdp.send.assert_any_call("Input.insertText", {"text": "你好"}, "chat-session")
         key_calls = [call for call in cdp.send.call_args_list if call.args[0] == "Input.dispatchKeyEvent"]
-        self.assertEqual(len(key_calls), 2)
+        self.assertEqual(len(key_calls), 3)
         self.assertFalse(any(call.args[0] == "Page.navigate" for call in cdp.send.call_args_list))
 
     def test_inbox_discovery_url_must_stay_on_zhipin(self):
@@ -1414,6 +1459,1285 @@ class ProjectScopeTests(unittest.TestCase):
             "enable-llm",
         ):
             self.assertNotIn(forbidden, combined)
+
+
+class SendModeTests(unittest.TestCase):
+    VALID_LINK = "https://www.zhipin.com/job_detail/abc123.html?lid=1&securityId=2"
+    SECOND_LINK = "https://www.zhipin.com/job_detail/def456.html?lid=3&securityId=4"
+
+    def _contact_state(self, **overrides):
+        state = {
+            "status": "招聘中",
+            "buttons": [{"label": "立即沟通", "visible": True}],
+            "risk_markers": [],
+            "url": self.VALID_LINK,
+        }
+        state.update(overrides)
+        return json.dumps(state, ensure_ascii=False)
+
+    def test_send_js_constants_cover_contact_and_composer(self):
+        module = load_module()
+        self.assertIn("立即沟通", module.CONTACT_BUTTON_STATE_JS)
+        self.assertIn("继续沟通", module.CLICK_CONTACT_BUTTON_JS)
+        self.assertIn("contenteditable", module.CHAT_COMPOSER_STATE_JS)
+        self.assertIn("has_input", module.CHAT_COMPOSER_STATE_JS)
+        self.assertIn("scrollIntoView", module.SCROLL_CONTACT_BUTTON_JS)
+
+    def test_send_validates_content_and_links_before_cdp(self):
+        module = load_module()
+        with mock.patch.object(module, "CDPSession",
+                               side_effect=AssertionError("不应连接 CDP")):
+            with self.assertRaisesRegex(ValueError, "非空"):
+                module.send_to_job_links(self.VALID_LINK, "  ")
+            with self.assertRaisesRegex(ValueError, "--job_link"):
+                module.send_to_job_links("", "你好")
+            with self.assertRaisesRegex(ValueError, "非法 JD 链接"):
+                module.send_to_job_links("https://example.com/x.html", "你好")
+            with self.assertRaisesRegex(ValueError, "500"):
+                module.send_to_job_links(self.VALID_LINK, "字" * 501)
+
+    def test_send_main_rejects_missing_content_and_links(self):
+        module = load_module()
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "send", "--job_link", self.VALID_LINK,
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 2)
+
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "send", "--content", "你好",
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 2)
+
+    def test_send_main_stdout_emits_json_without_file(self):
+        module = load_module()
+        fake = {
+            "mode": "send", "total": 1, "sent": 1,
+            "skipped": 0, "aborted": 0, "results": [],
+            "sent_at": "now", "scope": "",
+        }
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "send", "--content", "你好",
+                "--job_link", self.VALID_LINK, "--stdout",
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             mock.patch.object(module, "send_to_job_links",
+                               return_value=fake), \
+             mock.patch.object(module, "write_json_atomic") as write_mock, \
+             redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 0)
+        write_mock.assert_not_called()
+        self.assertIn('"mode": "send"', output.getvalue())
+
+    def test_send_main_writes_file_without_stdout(self):
+        module = load_module()
+        fake = {"mode": "send", "total": 1, "sent": 0, "skipped": 1,
+                "aborted": 0, "results": [], "sent_at": "now", "scope": ""}
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "send", "--content", "你好",
+                "--job_link", self.VALID_LINK,
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             mock.patch.object(module, "send_to_job_links",
+                               return_value=fake), \
+             mock.patch.object(module, "write_json_atomic") as write_mock, \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 0)
+        write_mock.assert_called_once()
+
+    def test_send_one_job_link_clicks_and_sends_once_in_place(self):
+        module = load_module()
+        cdp = mock.Mock()
+        outgoing = {"count": 0}
+        composer = {"text": ""}
+
+        def eval_js(script, sid):
+            if "composer_text" in script:
+                return composer["text"]
+            if "riskMarkers" in script and "buttons" in script:
+                return self._contact_state()
+            if "clicked" in script:
+                return json.dumps({"clicked": "立即沟通"})
+            if "has_input" in script:
+                return json.dumps({"has_input": True, "tag": "contenteditable",
+                                   "risk_markers": [], "url": "https://www.zhipin.com/web/geek/chat"})
+            if "el.focus" in script:
+                return json.dumps({"ok": True, "tag": "contenteditable"})
+            if "message-item" in script:
+                outgoing["count"] += 1
+                return outgoing["count"]
+            return None
+
+        cdp.eval_js.side_effect = eval_js
+
+        def send(method, params=None, sid=None, timeout=30):
+            if method == "Input.insertText":
+                composer["text"] += (params or {}).get("text", "")
+                return {"result": {}}
+            if method == "Input.dispatchKeyEvent":
+                composer["text"] = ""
+                return {"result": {}}
+            if method == "Target.getTargets":
+                return {"result": {"targetInfos": [
+                    {"targetId": "jd-tid", "type": "page", "url": self.VALID_LINK},
+                ]}}
+            if method == "DOM.getDocument":
+                return {"result": {"root": {"nodeId": 1}}}
+            if method == "DOM.querySelector":
+                return {"result": {"nodeId": 2}}
+            return {"result": {}}
+
+        cdp.send.side_effect = send
+        with mock.patch.object(module, "create_page_session",
+                               return_value=("jd-tid", "jd-sid")), \
+             mock.patch.object(module.time, "sleep"):
+            result = module.send_one_job_link(cdp, self.VALID_LINK, "你好")
+
+        self.assertTrue(result["submitted"])
+        self.assertTrue(result["post_send_visible"])
+        self.assertEqual(result["message"], "你好")
+        cdp.send.assert_any_call("Input.insertText", {"text": "你好"}, "jd-sid")
+        key_calls = [call for call in cdp.send.call_args_list
+                     if call.args[0] == "Input.dispatchKeyEvent"]
+        self.assertEqual(len(key_calls), 3)
+        cdp.send.assert_any_call("Target.closeTarget", {"targetId": "jd-tid"})
+        self.assertFalse(any(call.args[0] == "Target.attachToTarget"
+                             for call in cdp.send.call_args_list))
+
+    def test_send_one_job_link_attaches_popup_chat_target(self):
+        module = load_module()
+        cdp = mock.Mock()
+        outgoing = {"count": 0}
+        composer = {"text": ""}
+        get_targets_calls = {"n": 0}
+
+        def eval_js(script, sid):
+            if "composer_text" in script:
+                return composer["text"]
+            if "riskMarkers" in script and "buttons" in script:
+                return self._contact_state(buttons=[
+                    {"label": "继续沟通", "visible": True}])
+            if "clicked" in script:
+                return json.dumps({"clicked": "继续沟通"})
+            if "has_input" in script:
+                if sid == "jd-sid":
+                    return json.dumps({"has_input": False, "tag": "",
+                                       "risk_markers": [], "url": self.VALID_LINK})
+                return json.dumps({"has_input": True, "tag": "contenteditable",
+                                   "risk_markers": [], "url": "https://www.zhipin.com/web/geek/chat"})
+            if "el.focus" in script:
+                return json.dumps({"ok": True, "tag": "contenteditable"})
+            if "message-item" in script:
+                outgoing["count"] += 1
+                return outgoing["count"]
+            return None
+
+        cdp.eval_js.side_effect = eval_js
+
+        def send(method, params=None, sid=None, timeout=30):
+            if method == "Input.insertText":
+                composer["text"] += (params or {}).get("text", "")
+                return {"result": {}}
+            if method == "Input.dispatchKeyEvent":
+                composer["text"] = ""
+                return {"result": {}}
+            if method == "Target.getTargets":
+                get_targets_calls["n"] += 1
+                targets = [{"targetId": "jd-tid", "type": "page", "url": self.VALID_LINK}]
+                if get_targets_calls["n"] > 1:
+                    targets.append({"targetId": "chat-tid", "type": "page",
+                                    "url": "https://www.zhipin.com/web/geek/chat?lid=1&securityId=2"})
+                return {"result": {"targetInfos": targets}}
+            if method == "Target.attachToTarget":
+                return {"result": {"sessionId": "chat-sid"}}
+            if method == "DOM.getDocument":
+                return {"result": {"root": {"nodeId": 1}}}
+            if method == "DOM.querySelector":
+                return {"result": {"nodeId": 2}}
+            return {"result": {}}
+
+        cdp.send.side_effect = send
+        with mock.patch.object(module, "create_page_session",
+                               return_value=("jd-tid", "jd-sid")), \
+             mock.patch.object(module.time, "sleep"):
+            result = module.send_one_job_link(cdp, self.VALID_LINK, "你好")
+
+        self.assertTrue(result["submitted"])
+        cdp.send.assert_any_call("Target.attachToTarget",
+                                 {"targetId": "chat-tid", "flatten": True})
+        cdp.send.assert_any_call("Input.insertText", {"text": "你好"}, "chat-sid")
+        cdp.send.assert_any_call("Target.closeTarget", {"targetId": "chat-tid"})
+        cdp.send.assert_any_call("Target.closeTarget", {"targetId": "jd-tid"})
+
+    def test_send_one_job_link_falls_back_to_trusted_mouse_click(self):
+        module = load_module()
+        cdp = mock.Mock()
+        outgoing = {"count": 0}
+        composer = {"text": ""}
+        mouse_sent = {"v": False}
+
+        def eval_js(script, sid):
+            if "composer_text" in script:
+                return composer["text"]
+            if "riskMarkers" in script and "buttons" in script:
+                return self._contact_state()
+            if "clicked" in script:
+                return json.dumps({"clicked": "立即沟通"})
+            if "scrollIntoView" in script:
+                return True
+            if "getBoundingClientRect" in script:
+                return json.dumps({"x": 400, "y": 300, "visible": True})
+            if "has_input" in script:
+                if sid == "jd-sid":
+                    return json.dumps({"has_input": False, "tag": "",
+                                       "risk_markers": [], "url": self.VALID_LINK})
+                return json.dumps({"has_input": True, "tag": "contenteditable",
+                                   "risk_markers": [], "url": "https://www.zhipin.com/web/geek/chat"})
+            if "el.focus" in script:
+                return json.dumps({"ok": True, "tag": "contenteditable"})
+            if "message-item" in script:
+                outgoing["count"] += 1
+                return outgoing["count"]
+            return None
+
+        cdp.eval_js.side_effect = eval_js
+
+        def send(method, params=None, sid=None, timeout=30):
+            if method == "Input.insertText":
+                composer["text"] += (params or {}).get("text", "")
+                return {"result": {}}
+            if method == "Input.dispatchKeyEvent":
+                composer["text"] = ""
+                return {"result": {}}
+            if method == "Input.dispatchMouseEvent":
+                mouse_sent["v"] = True
+                return {"result": {}}
+            if method == "Target.getTargets":
+                targets = [{"targetId": "jd-tid", "type": "page", "url": self.VALID_LINK}]
+                if mouse_sent["v"]:
+                    targets.append({"targetId": "chat-tid", "type": "page",
+                                    "url": "https://www.zhipin.com/web/geek/chat"})
+                return {"result": {"targetInfos": targets}}
+            if method == "Target.attachToTarget":
+                return {"result": {"sessionId": "chat-sid"}}
+            if method == "DOM.getDocument":
+                return {"result": {"root": {"nodeId": 1}}}
+            if method == "DOM.querySelector":
+                return {"result": {"nodeId": 2}}
+            return {"result": {}}
+
+        cdp.send.side_effect = send
+        with mock.patch.object(module, "create_page_session",
+                               return_value=("jd-tid", "jd-sid")), \
+             mock.patch.object(module.time, "sleep"):
+            result = module.send_one_job_link(cdp, self.VALID_LINK, "你好")
+
+        self.assertTrue(result["submitted"])
+        mouse_events = [call for call in cdp.send.call_args_list
+                        if call.args[0] == "Input.dispatchMouseEvent"]
+        self.assertEqual(len(mouse_events), 2)
+        cdp.send.assert_any_call("Input.insertText", {"text": "你好"}, "chat-sid")
+
+    def test_send_one_job_link_aborts_on_risk_control(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.eval_js.side_effect = lambda script, sid: self._contact_state(
+            status="", buttons=[], risk_markers=["环境异常"])
+        with mock.patch.object(module, "create_page_session",
+                               return_value=("jd-tid", "jd-sid")):
+            with self.assertRaisesRegex(module.SendRiskControlError, "环境异常"):
+                module.send_one_job_link(cdp, self.VALID_LINK, "你好")
+
+    def test_send_one_job_link_skips_closed_job(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.eval_js.side_effect = lambda script, sid: self._contact_state(
+            status="已关闭")
+        with mock.patch.object(module, "create_page_session",
+                               return_value=("jd-tid", "jd-sid")):
+            with self.assertRaisesRegex(module.SendJobUnavailableError, "已关闭"):
+                module.send_one_job_link(cdp, self.VALID_LINK, "你好")
+
+    def test_send_batch_skips_unavailable_and_counts(self):
+        module = load_module()
+        cdp = mock.Mock()
+
+        def fake_send_one(cdp_arg, link, content):
+            if link == self.VALID_LINK:
+                raise module.SendJobUnavailableError("职位已关闭，跳过")
+            return {"submitted": True, "post_send_visible": True,
+                    "message": content}
+
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+             mock.patch.object(module.time, "sleep"), \
+             mock.patch.object(module, "send_one_job_link",
+                               side_effect=fake_send_one):
+            summary = module.send_to_job_links(
+                f"{self.VALID_LINK},{self.SECOND_LINK}", "你好")
+
+        self.assertEqual(summary["total"], 2)
+        self.assertEqual(summary["sent"], 1)
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual([r["status"] for r in summary["results"]],
+                         ["skipped", "sent"])
+
+    def test_send_batch_stops_immediately_on_risk_control(self):
+        module = load_module()
+        cdp = mock.Mock()
+        processed = []
+
+        def fake_send_one(cdp_arg, link, content):
+            processed.append(link)
+            raise module.SendRiskControlError("检测到 BOSS 风控提示：环境异常")
+
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+             mock.patch.object(module.time, "sleep"), \
+             mock.patch.object(module, "send_one_job_link",
+                               side_effect=fake_send_one):
+            summary = module.send_to_job_links(
+                f"{self.VALID_LINK},{self.SECOND_LINK}", "你好")
+
+        self.assertEqual(summary["aborted"], 1)
+        self.assertEqual(len(processed), 1, "检测到风控后不应继续处理剩余岗位")
+
+class ReadModeTests(unittest.TestCase):
+    VALID_LINK = "https://www.zhipin.com/job_detail/abc123.html?lid=1&securityId=2"
+    SECOND_LINK = "https://www.zhipin.com/job_detail/def456.html?lid=3&securityId=4"
+
+    def _contact_state(self, **overrides):
+        state = {
+            "status": "招聘中",
+            "buttons": [{"label": "立即沟通", "visible": True}],
+            "risk_markers": [],
+            "url": self.VALID_LINK,
+        }
+        state.update(overrides)
+        return json.dumps(state, ensure_ascii=False)
+
+    def test_read_reuses_contact_navigation_and_chat_extractor(self):
+        module = load_module()
+        self.assertIn("立即沟通", module.CONTACT_BUTTON_STATE_JS)
+        self.assertIn("item-(?:self|myself)", module.EXTRACT_ACTIVE_INBOX_JS)
+        self.assertIn("outgoing_text", module.EXTRACT_ACTIVE_INBOX_JS)
+        self.assertIn("incoming_text", module.EXTRACT_ACTIVE_INBOX_JS)
+        self.assertIn("message-item", module.EXTRACT_ACTIVE_INBOX_JS)
+        self.assertIs(module.RiskControlError, module.SendRiskControlError)
+        self.assertIs(module.JobUnavailableError, module.SendJobUnavailableError)
+
+    def test_read_validates_links_before_cdp(self):
+        module = load_module()
+        with mock.patch.object(module, "CDPSession",
+                               side_effect=AssertionError("不应连接 CDP")):
+            with self.assertRaisesRegex(ValueError, "--job_link"):
+                module.read_job_links("")
+            with self.assertRaisesRegex(ValueError, "非法 JD 链接"):
+                module.read_job_links("https://example.com/x.html")
+
+    def test_read_main_rejects_missing_link(self):
+        module = load_module()
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "read",
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 2)
+
+    def test_read_main_requires_stdout(self):
+        module = load_module()
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "read",
+                "--job_link", self.VALID_LINK,
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 2)
+
+    def test_read_main_stdout_emits_json(self):
+        module = load_module()
+        fake = {"mode": "read", "total": 1, "read": 1, "skipped": 0,
+                "aborted": 0, "results": [], "read_at": "now", "scope": ""}
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "read",
+                "--job_link", self.VALID_LINK, "--stdout",
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             mock.patch.object(module, "read_job_links",
+                               return_value=fake), \
+             redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 0)
+        self.assertIn('"mode": "read"', output.getvalue())
+
+    def test_read_one_job_link_reads_in_place_with_sender(self):
+        module = load_module()
+        cdp = mock.Mock()
+        rendered = json.dumps({
+            "expected_contact": "",
+            "expected_contact_in_active_header": False,
+            "active_header": None,
+            "rendered_message_count": 2,
+            "rendered_entries": [
+                {"type": "incoming_text", "text": "你好，欢迎投递", "image_count": 0,
+                 "link_count": 0, "class_hint": "message-item"},
+                {"type": "outgoing_text", "text": "您好，我对该岗位很感兴趣", "image_count": 0,
+                 "link_count": 0, "class_hint": "message-item item-myself"},
+            ],
+            "composer_controls": [{"tag": "contenteditable", "placeholder": ""}],
+        }, ensure_ascii=False)
+
+        def eval_js(script, sid):
+            if "riskMarkers" in script and "buttons" in script:
+                return self._contact_state()
+            if "clicked" in script:
+                return json.dumps({"clicked": "立即沟通"})
+            if "has_input" in script:
+                return json.dumps({"has_input": True, "tag": "contenteditable",
+                                   "risk_markers": [],
+                                   "url": "https://www.zhipin.com/web/geek/chat?lid=1&securityId=2"})
+            if "message-item" in script:
+                return rendered
+            return None
+
+        cdp.eval_js.side_effect = eval_js
+
+        def send(method, params=None, sid=None, timeout=30):
+            if method == "Target.getTargets":
+                return {"result": {"targetInfos": [
+                    {"targetId": "jd-tid", "type": "page", "url": self.VALID_LINK},
+                ]}}
+            return {"result": {}}
+
+        cdp.send.side_effect = send
+        with mock.patch.object(module, "create_page_session",
+                               return_value=("jd-tid", "jd-sid")), \
+             mock.patch.object(module.time, "sleep"):
+            result = module.read_one_job_link(cdp, self.VALID_LINK)
+
+        self.assertEqual(result["mode"], "read")
+        self.assertEqual(result["rendered_message_count"], 2)
+        senders = [m["sender"] for m in result["messages"]]
+        self.assertEqual(senders, ["other", "self"])
+        self.assertEqual(result["sender_counts"], {"other": 1, "self": 1})
+        self.assertFalse(any(call.args[0] == "Input.insertText"
+                             for call in cdp.send.call_args_list),
+                         "read 模式不得发送消息")
+        self.assertFalse(any(call.args[0] == "Input.dispatchKeyEvent"
+                             for call in cdp.send.call_args_list))
+        cdp.send.assert_any_call("Target.closeTarget", {"targetId": "jd-tid"})
+
+    def test_read_one_job_link_attaches_popup_chat_target(self):
+        module = load_module()
+        cdp = mock.Mock()
+        get_targets_calls = {"n": 0}
+        rendered = json.dumps({
+            "rendered_entries": [
+                {"type": "system_event", "text": "你们已经打过招呼", "image_count": 0,
+                 "link_count": 0, "class_hint": "message-item item-system"},
+            ],
+            "composer_controls": [],
+        }, ensure_ascii=False)
+
+        def eval_js(script, sid):
+            if "riskMarkers" in script and "buttons" in script:
+                return self._contact_state(buttons=[
+                    {"label": "继续沟通", "visible": True}])
+            if "clicked" in script:
+                return json.dumps({"clicked": "继续沟通"})
+            if "has_input" in script:
+                if sid == "jd-sid":
+                    return json.dumps({"has_input": False, "tag": "",
+                                       "risk_markers": [], "url": self.VALID_LINK})
+                return json.dumps({"has_input": True, "tag": "contenteditable",
+                                   "risk_markers": [],
+                                   "url": "https://www.zhipin.com/web/geek/chat?lid=1&securityId=2"})
+            if "message-item" in script:
+                return rendered
+            return None
+
+        cdp.eval_js.side_effect = eval_js
+
+        def send(method, params=None, sid=None, timeout=30):
+            if method == "Target.getTargets":
+                get_targets_calls["n"] += 1
+                targets = [{"targetId": "jd-tid", "type": "page", "url": self.VALID_LINK}]
+                if get_targets_calls["n"] > 1:
+                    targets.append({"targetId": "chat-tid", "type": "page",
+                                    "url": "https://www.zhipin.com/web/geek/chat?lid=1&securityId=2"})
+                return {"result": {"targetInfos": targets}}
+            if method == "Target.attachToTarget":
+                return {"result": {"sessionId": "chat-sid"}}
+            return {"result": {}}
+
+        cdp.send.side_effect = send
+        with mock.patch.object(module, "create_page_session",
+                               return_value=("jd-tid", "jd-sid")), \
+             mock.patch.object(module.time, "sleep"):
+            result = module.read_one_job_link(cdp, self.VALID_LINK)
+
+        self.assertEqual(result["mode"], "read")
+        self.assertEqual(
+            result["conversation_url"],
+            "https://www.zhipin.com/web/geek/chat?lid=1&securityId=2")
+        self.assertEqual(result["message_type_counts"], {"system_event": 1})
+        self.assertEqual(result["sender_counts"], {"system": 1})
+        cdp.send.assert_any_call("Target.attachToTarget",
+                                 {"targetId": "chat-tid", "flatten": True})
+        cdp.send.assert_any_call("Target.closeTarget", {"targetId": "chat-tid"})
+        cdp.send.assert_any_call("Target.closeTarget", {"targetId": "jd-tid"})
+
+    def test_read_one_job_link_aborts_on_risk_control(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.eval_js.side_effect = lambda script, sid: self._contact_state(
+            status="", buttons=[], risk_markers=["环境异常"])
+        with mock.patch.object(module, "create_page_session",
+                               return_value=("jd-tid", "jd-sid")):
+            with self.assertRaisesRegex(module.RiskControlError, "环境异常"):
+                module.read_one_job_link(cdp, self.VALID_LINK)
+
+    def test_read_one_job_link_skips_closed_job(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.eval_js.side_effect = lambda script, sid: self._contact_state(
+            status="已关闭")
+        with mock.patch.object(module, "create_page_session",
+                               return_value=("jd-tid", "jd-sid")):
+            with self.assertRaisesRegex(module.JobUnavailableError, "已关闭"):
+                module.read_one_job_link(cdp, self.VALID_LINK)
+
+    def test_read_batch_skips_unavailable_and_counts(self):
+        module = load_module()
+        cdp = mock.Mock()
+
+        def fake_read_one(cdp_arg, link, max_entries=200, result_mode="read"):
+            if link == self.VALID_LINK:
+                raise module.JobUnavailableError("职位已关闭，跳过")
+            return {"rendered_message_count": 3, "messages": [],
+                    "scope": "", "message_type_counts": {}, "sender_counts": {}}
+
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+             mock.patch.object(module.time, "sleep"), \
+             mock.patch.object(module, "read_one_job_link",
+                               side_effect=fake_read_one):
+            summary = module.read_job_links(
+                f"{self.VALID_LINK},{self.SECOND_LINK}")
+
+        self.assertEqual(summary["total"], 2)
+        self.assertEqual(summary["read"], 1)
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual([r["status"] for r in summary["results"]],
+                         ["skipped", "read"])
+
+    def test_read_batch_stops_immediately_on_risk_control(self):
+        module = load_module()
+        cdp = mock.Mock()
+        processed = []
+
+        def fake_read_one(cdp_arg, link, max_entries=200, result_mode="read"):
+            processed.append(link)
+            raise module.RiskControlError("检测到 BOSS 风控提示：环境异常")
+
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+             mock.patch.object(module.time, "sleep"), \
+             mock.patch.object(module, "read_one_job_link",
+                               side_effect=fake_read_one):
+            summary = module.read_job_links(
+                f"{self.VALID_LINK},{self.SECOND_LINK}")
+
+        self.assertEqual(summary["aborted"], 1)
+        self.assertEqual(len(processed), 1, "检测到风控后不应继续处理剩余岗位")
+
+
+class ChatReadAndSendVerificationTests(unittest.TestCase):
+    VALID_LINK = ("https://www.zhipin.com/job_detail/"
+                  "52b2610d4a110fa70nF62NW1EVJQ.html?securityId=abcd~~")
+    SECOND_LINK = ("https://www.zhipin.com/job_detail/"
+                   "another0nF62NW1EVJQ.html?securityId=efgh~~")
+
+    def _contact_state(self, **overrides):
+        state = {
+            "status": "招聘中",
+            "buttons": [{"label": "立即沟通", "visible": True}],
+            "risk_markers": [],
+            "url": self.VALID_LINK,
+        }
+        state.update(overrides)
+        return json.dumps(state, ensure_ascii=False)
+
+
+    def test_strip_boss_time_prefix_strips_delivery_prefix(self):
+        module = load_module()
+        strip = module._strip_boss_time_prefix
+        self.assertEqual(strip("12:45 送达 你好"), "你好")
+        self.assertEqual(strip("2026-08-18 12:45 送达 你好"), "你好")
+        self.assertEqual(strip("送达 你好"), "你好")
+        self.assertEqual(strip("你好"), "你好")
+        self.assertEqual(strip(""), "")
+
+    def test_readback_matches_detects_sent_content(self):
+        module = load_module()
+        row = {"type": "outgoing_text", "text": "12:45 送达 你好，我是候选人"}
+        self.assertTrue(module._readback_matches(row, "你好，我是候选人"))
+        self.assertFalse(module._readback_matches(row, "完全不同的内容"))
+        self.assertFalse(module._readback_matches({}, "你好"))
+        self.assertFalse(module._readback_matches(None, "你好"))
+        self.assertFalse(module._readback_matches(
+            {"type": "outgoing_text", "text": "12:45 送达 你好"}, ""))
+
+    def test_sidebar_extract_js_covers_name_status_and_time(self):
+        module = load_module()
+        self.assertIn(".friend-content", module.EXTRACT_SIDEBAR_CONVERSATIONS_JS)
+        self.assertIn(".name-text", module.EXTRACT_SIDEBAR_CONVERSATIONS_JS)
+        self.assertIn(".message-status", module.EXTRACT_SIDEBAR_CONVERSATIONS_JS)
+        self.assertIn("status-read", module.EXTRACT_SIDEBAR_CONVERSATIONS_JS)
+        self.assertIn("status-delivery", module.EXTRACT_SIDEBAR_CONVERSATIONS_JS)
+        self.assertIn(".last-msg-text", module.EXTRACT_SIDEBAR_CONVERSATIONS_JS)
+        self.assertIn("__INDEX__", module.CLICK_SIDEBAR_ITEM_JS)
+        self.assertIn(".friend-content-warp", module.CLICK_SIDEBAR_ITEM_JS)
+
+    def test_click_sidebar_conversation_ok_and_invalid(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.eval_js.return_value = json.dumps(
+            {"ok": True, "index": 2, "count": 5, "x": 301, "y": 206})
+        self.assertEqual(module._click_sidebar_conversation(cdp, "sid", 2), 5)
+        mouse_calls = [call for call in cdp.send.call_args_list
+                       if call.args[0] == "Input.dispatchMouseEvent"]
+        self.assertEqual(len(mouse_calls), 2)
+        self.assertEqual(mouse_calls[0].args[1]["type"], "mousePressed")
+        self.assertEqual(mouse_calls[1].args[1]["type"], "mouseReleased")
+        self.assertEqual(mouse_calls[0].args[1]["x"], 301)
+        self.assertEqual(mouse_calls[0].args[1]["y"], 206)
+        cdp.eval_js.return_value = json.dumps({"ok": False, "index": 9, "count": 3})
+        with self.assertRaisesRegex(RuntimeError, "序号 9 无效"):
+            module._click_sidebar_conversation(cdp, "sid", 9)
+
+    def test_read_open_chat_conversation_reads_current_selection(self):
+        module = load_module()
+        cdp = mock.Mock()
+
+        def send(method, params=None, sid=None, timeout=30):
+            if method == "Target.getTargets":
+                return {"result": {"targetInfos": [{
+                    "targetId": "chat-target", "type": "page",
+                    "url": "https://www.zhipin.com/web/geek/chat",
+                }]}}
+            if method == "Target.attachToTarget":
+                return {"result": {"sessionId": "chat-session"}}
+            return {"result": {}}
+
+        cdp.send.side_effect = send
+        cdp.eval_js.side_effect = self._chat_payload
+
+        with mock.patch.object(module, "CDPSession", return_value=cdp):
+            result = module.read_open_chat_conversation("刘姗", max_entries=10)
+
+        self.assertEqual(result["mode"], "read-chat")
+        self.assertEqual(result["rendered_message_count"], 3)
+        self.assertEqual(result["sender_counts"], {"self": 1, "other": 1, "system": 1})
+        self.assertEqual(result["messages"][0]["sender"], "other")
+        self.assertEqual(result["messages"][1]["sender"], "self")
+        calls = [call.args[0] for call in cdp.send.call_args_list]
+        self.assertNotIn("Page.navigate", calls)
+        self.assertFalse(any(method.startswith("Input.") for method in calls))
+
+    def _chat_payload(self, script, sid):
+        if "message-item" not in script:
+            return None
+        return json.dumps({
+            "expected_contact_in_active_header": True,
+            "active_header": {"text": "刘姗｜HR"},
+            "rendered_entries": [
+                {"type": "incoming_text", "text": "你好，看到你投递了 XX 岗",
+                 "image_count": 0, "link_count": 0, "class_hint": "message-item"},
+                {"type": "outgoing_text", "text": "12:45 送达 您好，我对该岗位很感兴趣",
+                 "image_count": 0, "link_count": 0, "class_hint": "message-item item-myself"},
+                {"type": "system_event", "text": "", "image_count": 0, "link_count": 0,
+                 "class_hint": "message-item item-system"},
+            ],
+            "composer_controls": [],
+        }, ensure_ascii=False)
+
+    def test_read_open_chat_conversation_verifies_expected_contact(self):
+        module = load_module()
+        cdp = mock.Mock()
+
+        def send(method, params=None, sid=None, timeout=30):
+            if method == "Target.getTargets":
+                return {"result": {"targetInfos": [{
+                    "targetId": "chat-target", "type": "page",
+                    "url": "https://www.zhipin.com/web/geek/chat",
+                }]}}
+            if method == "Target.attachToTarget":
+                return {"result": {"sessionId": "chat-session"}}
+            return {"result": {}}
+
+        cdp.send.side_effect = send
+        cdp.eval_js.side_effect = lambda script, sid: json.dumps({
+            "expected_contact_in_active_header": False,
+            "active_header": {"text": "其他人｜HR"},
+            "rendered_entries": [],
+            "composer_controls": [],
+        }, ensure_ascii=False)
+
+        with mock.patch.object(module, "CDPSession", return_value=cdp):
+            with self.assertRaisesRegex(RuntimeError, "未显示"):
+                module.read_open_chat_conversation("刘姗")
+
+    def test_switch_and_read_conversations_clicks_sidebar_indices(self):
+        module = load_module()
+        cdp = mock.Mock()
+        clicked = []
+        cdp.eval_js.side_effect = self._chat_payload
+
+        def click_side(cdp_arg, sid, index):
+            clicked.append(index)
+            return 3
+
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+             mock.patch.object(module, "attach_active_inbox_target",
+                               return_value=("chat-target", "chat-session")), \
+             mock.patch.object(module, "_chat_page_risk_check"), \
+             mock.patch.object(module, "_click_sidebar_conversation",
+                               side_effect=click_side), \
+             mock.patch.object(module.time, "sleep"):
+            result = module.switch_and_read_conversations("0,2", max_entries=10)
+
+        self.assertEqual(result["mode"], "read-chat-switch")
+        self.assertEqual(clicked, [0, 2])
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["read"], 2)
+
+    def test_switch_and_read_rejects_invalid_index(self):
+        module = load_module()
+        with self.assertRaisesRegex(ValueError, "非法的会话序号"):
+            module.switch_and_read_conversations("abc")
+        with self.assertRaisesRegex(ValueError, "--switch-index"):
+            module.switch_and_read_conversations("")
+
+    def test_list_chat_conversations_merges_native_and_sidebar(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.send.side_effect = lambda method, params=None, sid=None, timeout=30: {"result": {}}
+        native = [{
+            "name": "刘姗", "brandName": "旧公司", "title": "招聘经理",
+            "avatar": "https://img.example/avatar.png",
+            "encryptUid": "uid-1", "encryptJobId": "job-1",
+            "sourceTitle": "Agent开发", "securityId": "s1",
+            "unreadMsgCount": 2, "lastTime": "13:00", "lastTS": 123,
+            "isTop": False, "chatStatus": 0, "relationType": 2,
+            "uid": 90001,
+            "lastMessageInfo": {
+                "fromId": 204016845, "toId": 90001, "status": 2,
+                "showText": "13:00 已读 你好", "msgTime": 1000,
+            },
+        }]
+        cdp.eval_js.side_effect = lambda script, sid: (
+            json.dumps([{
+                "index": 0, "name": "刘姗", "company": "新公司", "title": "招聘经理",
+                "read_status": "已读", "last_time": "13:02",
+                "last_message_preview": "你好", "selected": True,
+                "avatar": "https://img.example/side.png",
+            }], ensure_ascii=False)
+            if ".friend-content" in script else None
+        )
+
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+             mock.patch.object(module, "create_page_session",
+                               return_value=("tid", "sid")), \
+             mock.patch.object(module, "wait_for_native_inbox_list",
+                               return_value=native), \
+             mock.patch.object(module, "_chat_page_risk_check"), \
+             mock.patch.object(module.time, "sleep"):
+            result = module.list_chat_conversations()
+
+        self.assertEqual(result["mode"], "read-list")
+        self.assertEqual(result["conversation_total"], 1)
+        self.assertEqual(result["unread_total"], 2)
+        row = result["conversations"][0]
+        self.assertEqual(row["index"], 0)
+        self.assertEqual(row["recruiter_name"], "刘姗")
+        self.assertEqual(row["company"], "新公司")
+        self.assertEqual(row["recruiter_title"], "招聘经理")
+        self.assertEqual(row["recruiter_avatar"], "https://img.example/side.png")
+        self.assertEqual(row["read_status"], "已读")
+        self.assertEqual(row["last_time"], "13:02")
+        self.assertTrue(row["selected"])
+        self.assertIn("job_detail/job-1", row["job_link"])
+        self.assertEqual(row["unread_count"], 2)
+        self.assertEqual(row["last_message_sender"], "self")
+        self.assertEqual(row["last_message_read"], "已读")
+        self.assertEqual(row["last_message_native_status"], 2)
+        self.assertEqual(row["last_message_text"], "13:00 已读 你好")
+
+    def test_last_message_info_derives_sender_and_read_state(self):
+        module = load_module()
+        self.assertEqual(module._last_message_info({
+            "uid": 90001,
+            "lastMessageInfo": {"fromId": 204016845, "status": 2},
+        })["sender"], "self")
+        self.assertEqual(module._last_message_info({
+            "uid": 90001,
+            "lastMessageInfo": {"fromId": 90001, "status": 2},
+        })["sender"], "other")
+        self.assertEqual(module._last_message_info({
+            "uid": 90001,
+            "lastMessageInfo": {"fromId": 90001, "status": 1},
+        })["read_state"], "送达")
+        self.assertEqual(module._last_message_info({
+            "uid": 90001,
+            "lastMessageInfo": {"fromId": 90001, "status": 0},
+        })["read_state"], "未读")
+        self.assertEqual(module._last_message_info({
+            "uid": 90001,
+        })["sender"], "unknown")
+        self.assertEqual(module._last_message_info({
+            "uid": 90001,
+            "lastMessageInfo": {"fromId": 90001, "status": 2, "showText": "文本"},
+        })["text"], "文本")
+
+    def test_match_sidebar_index_by_name_with_position_fallback(self):
+        module = load_module()
+        native = [
+            {"job_id": "job-a", "recruiter_name": "吴安琪", "company": "阿里", "filtered": False},
+            {"job_id": "job-b", "recruiter_name": "陈女士", "company": "算秩", "filtered": False},
+            {"job_id": "job-c", "recruiter_name": "张先生", "company": "均阳", "filtered": True},
+            {"job_id": "job-d", "recruiter_name": "闫朝伟", "company": "阿里", "filtered": False},
+        ]
+        sidebar = [
+            {"index": 0, "name": "吴安琪", "company": "阿里"},
+            {"index": 1, "name": "陈女士", "company": "算秩"},
+            {"index": 2, "name": "闫朝伟", "company": "阿里"},
+        ]
+        self.assertEqual(module._match_sidebar_index(native, sidebar, "job-a"), 0)
+        self.assertEqual(module._match_sidebar_index(native, sidebar, "job-b"), 1)
+        # 被过滤项不在侧边栏，name 匹配失败时按非过滤顺序回退
+        self.assertEqual(module._match_sidebar_index(native, sidebar, "job-d"), 2)
+        self.assertIsNone(module._match_sidebar_index(native, sidebar, "job-none"))
+
+    def test_match_sidebar_index_accepts_raw_native_keys(self):
+        module = load_module()
+        native = [
+            {"encryptJobId": "job-a", "name": "吴安琪", "brandName": "阿里", "filtered": False},
+            {"encryptJobId": "job-b", "name": "陈女士", "brandName": "算秩", "filtered": False},
+            {"encryptJobId": "job-c", "name": "张先生", "brandName": "均阳", "filtered": True},
+        ]
+        sidebar = [
+            {"index": 0, "name": "吴安琪", "company": "阿里"},
+            {"index": 1, "name": "陈女士", "company": "算秩"},
+        ]
+        self.assertEqual(module._match_sidebar_index(native, sidebar, "job-a"), 0)
+        self.assertEqual(module._match_sidebar_index(native, sidebar, "job-b"), 1)
+        self.assertIsNone(module._match_sidebar_index(native, sidebar, "job-c"))
+
+    def test_match_sidebar_index_disables_position_fallback_when_sidebar_missing_rows(self):
+        module = load_module()
+        # 侧边栏渲染了 14 行，但 native 有 15 项（张先生 relationType=5 未渲染）：
+        # 位置回退会点错人，必须返回 None。
+        native = [
+            {"encryptJobId": "job-a", "name": "吴安琪", "brandName": "阿里", "filtered": False},
+            {"encryptJobId": "job-hidden", "name": "张先生", "brandName": "均阳", "filtered": False},
+            {"encryptJobId": "job-b", "name": "闫朝伟", "brandName": "阿里", "filtered": False},
+        ]
+        sidebar = [
+            {"index": 0, "name": "吴安琪", "company": "阿里"},
+            {"index": 1, "name": "闫朝伟", "company": "阿里"},
+        ]
+        self.assertEqual(module._match_sidebar_index(native, sidebar, "job-a"), 0)
+        self.assertEqual(module._match_sidebar_index(native, sidebar, "job-b"), 1)
+        # 未渲染会话：位置回退被禁用，返回 None（上层回退 job_link）
+        self.assertIsNone(module._match_sidebar_index(native, sidebar, "job-hidden"))
+
+    def test_list_chat_conversations_marks_unrendered_rows(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.send.side_effect = lambda method, params=None, sid=None, timeout=30: {"result": {}}
+        native = [
+            {
+                "name": "吴安琪", "brandName": "阿里", "title": "招聘者",
+                "encryptUid": "uid-0", "encryptJobId": "job-0",
+                "unreadMsgCount": 0, "lastTime": "13:00", "lastTS": 1,
+                "uid": 90001, "filtered": False,
+                "lastMessageInfo": {"fromId": 90001, "status": 1, "showText": "你好", "msgTime": 1},
+            },
+            {
+                "name": "张先生", "brandName": "均阳", "title": "人事主管",
+                "encryptUid": "uid-1", "encryptJobId": "job-1",
+                "unreadMsgCount": 0, "lastTime": "昨天", "lastTS": 2,
+                "uid": 563895339, "filtered": False, "relationType": 5,
+                "lastMessageInfo": {"fromId": 563895339, "status": 0, "showText": "", "msgTime": 2},
+            },
+        ]
+        cdp.eval_js.side_effect = lambda script, sid: (
+            json.dumps([{
+                "index": 0, "name": "吴安琪", "company": "阿里", "title": "招聘者",
+                "read_status": "送达", "last_time": "13:00",
+                "last_message_preview": "你好", "selected": False, "avatar": "",
+            }], ensure_ascii=False)
+            if ".friend-content" in script else None
+        )
+        with mock.patch.object(module, "CDPSession", return_value=cdp),              mock.patch.object(module, "create_page_session",
+                               return_value=("tid", "sid")),              mock.patch.object(module, "wait_for_native_inbox_list",
+                               return_value=native),              mock.patch.object(module, "_chat_page_risk_check"),              mock.patch.object(module.time, "sleep"):
+            result = module.list_chat_conversations()
+        rendered = [r for r in result["conversations"] if r["rendered"]]
+        unrendered = [r for r in result["conversations"] if not r["rendered"]]
+        self.assertEqual(len(rendered), 1)
+        self.assertEqual(rendered[0]["index"], 0)
+        self.assertEqual(rendered[0]["recruiter_name"], "吴安琪")
+        self.assertEqual(len(unrendered), 1)
+        self.assertEqual(unrendered[0]["index"], None)
+        self.assertEqual(unrendered[0]["recruiter_name"], "张先生")
+        self.assertEqual(unrendered[0]["last_message_sender"], "other")
+
+    def test_attach_active_inbox_target_picks_first_of_many(self):
+        module = load_module()
+        cdp = mock.Mock()
+
+        def fake_send(method, params=None, sid=None, timeout=30):
+            if method == "Target.getTargets":
+                return {"result": {"targetInfos": [
+                    {"type": "page", "url": "https://www.zhipin.com/web/geek/chat", "targetId": "t1"},
+                    {"type": "page", "url": "https://www.zhipin.com/web/geek/chat", "targetId": "t2"},
+                ]}}
+            if method == "Target.attachToTarget":
+                return {"result": {"sessionId": "sess"}}
+            return {"result": {}}
+
+        cdp.send.side_effect = fake_send
+        tid, sid = module.attach_active_inbox_target(cdp)
+        self.assertEqual(tid, "t1")
+        self.assertEqual(sid, "sess")
+
+    def test_attach_active_inbox_target_raises_without_chat_page(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.send.return_value = {"result": {"targetInfos": [
+            {"type": "page", "url": "https://www.zhipin.com/job_detail/x.html", "targetId": "t1"},
+        ]}}
+        with self.assertRaisesRegex(RuntimeError, "未找到已打开的 BOSS 消息页"):
+            module.attach_active_inbox_target(cdp)
+
+    def test_list_chat_conversations_rejects_bad_inbox_url(self):
+        module = load_module()
+        with self.assertRaisesRegex(ValueError, "--inbox-url"):
+            module.list_chat_conversations("https://example.com/x")
+
+    def test_read_main_list_dispatches_to_list_chat_conversations(self):
+        module = load_module()
+        fake = {"mode": "read-list", "conversation_total": 1, "conversations": [],
+                "unread_total": 0, "inbox_url": "", "scope": "", "listed_at": "now"}
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "read", "--list", "--stdout",
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             mock.patch.object(module, "list_chat_conversations",
+                               return_value=fake), \
+             redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 0)
+        self.assertIn('"mode": "read-list"', output.getvalue())
+
+    def test_read_main_chat_switch_dispatches_to_switch_and_read(self):
+        module = load_module()
+        fake = {"mode": "read-chat-switch", "total": 1, "read": 1,
+                "skipped": 0, "results": [], "scope": "", "read_at": "now"}
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "read", "--chat",
+                "--switch-index", "0", "--stdout",
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             mock.patch.object(module, "switch_and_read_conversations",
+                               return_value=fake), \
+             redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 0)
+        self.assertIn('"mode": "read-chat-switch"', output.getvalue())
+
+    def test_read_main_chat_job_link_dispatches_to_switch_or_open(self):
+        module = load_module()
+        fake = {"mode": "read-chat", "total": 1, "read": 1, "skipped": 0,
+                "aborted": 0, "via_sidebar": 1, "via_job_link": 0,
+                "results": [], "read_at": "now", "scope": ""}
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "read", "--chat",
+                "--job_link", self.VALID_LINK, "--stdout",
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             mock.patch.object(module, "read_chat_switch_or_open",
+                               return_value=fake) as switch_or_open, \
+             redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 0)
+        self.assertEqual(switch_or_open.call_args.args[0], self.VALID_LINK)
+        self.assertIn('"mode": "read-chat"', output.getvalue())
+
+    def test_read_main_chat_current_dispatches_to_open_chat(self):
+        module = load_module()
+        fake = {"mode": "read-chat", "rendered_message_count": 0, "messages": [],
+                "message_type_counts": {}, "sender_counts": {}, "scope": "",
+                "composer_controls": [], "scraped_at": "now"}
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "read", "--chat", "--stdout",
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             mock.patch.object(module, "read_open_chat_conversation",
+                               return_value=fake), \
+             redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 0)
+        self.assertIn('"mode": "read-chat"', output.getvalue())
+
+    def test_read_main_list_rejects_missing_stdout(self):
+        module = load_module()
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--mode", "read", "--list",
+        ]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 2)
+
+    def test_send_one_job_link_reports_readback_verification(self):
+        module = load_module()
+        cdp = mock.Mock()
+        outgoing = {"count": 0}
+        composer = {"text": ""}
+        rendered = {"entries": []}
+
+        def eval_js(script, sid):
+            if "composer_text" in script:
+                return composer["text"]
+            if "riskMarkers" in script and "buttons" in script:
+                return self._contact_state()
+            if "clicked" in script:
+                return json.dumps({"clicked": "立即沟通"})
+            if "has_input" in script:
+                return json.dumps({"has_input": True, "tag": "contenteditable",
+                                   "risk_markers": [], "url": "https://www.zhipin.com/web/geek/chat"})
+            if "el.focus" in script:
+                return json.dumps({"ok": True, "tag": "contenteditable"})
+            if "message-item" in script:
+                return json.dumps({
+                    "active_header": {"text": "刘姗｜HR"},
+                    "rendered_entries": rendered["entries"],
+                    "composer_controls": [],
+                }, ensure_ascii=False)
+            return None
+
+        cdp.eval_js.side_effect = eval_js
+
+        def send(method, params=None, sid=None, timeout=30):
+            if method == "Input.insertText":
+                composer["text"] += (params or {}).get("text", "")
+                return {"result": {}}
+            if method == "Input.dispatchKeyEvent":
+                composer["text"] = ""
+                return {"result": {}}
+            if method == "Target.getTargets":
+                return {"result": {"targetInfos": [
+                    {"targetId": "jd-tid", "type": "page", "url": self.VALID_LINK},
+                ]}}
+            if method == "DOM.getDocument":
+                return {"result": {"root": {"nodeId": 1}}}
+            if method == "DOM.querySelector":
+                return {"result": {"nodeId": 2}}
+            return {"result": {}}
+
+        cdp.send.side_effect = send
+        with mock.patch.object(module, "create_page_session",
+                               return_value=("jd-tid", "jd-sid")), \
+             mock.patch.object(module, "_dispatch_enter"), \
+             mock.patch.object(module, "count_active_outgoing_text",
+                               return_value=0), \
+             mock.patch.object(module, "_read_composer_text",
+                               side_effect=lambda cdp_arg, sid_arg: composer["text"]), \
+             mock.patch.object(module.time, "sleep"):
+            # 先模拟发送完成后历史里出现我们的消息
+            def mark_sent(*args):
+                rendered["entries"] = [
+                    {"type": "outgoing_text", "text": "12:45 送达 你好",
+                     "image_count": 0, "link_count": 0, "class_hint": "message-item"},
+                ]
+            cdp.eval_js.side_effect = eval_js
+            module._dispatch_enter.side_effect = mark_sent
+            result = module.send_one_job_link(cdp, self.VALID_LINK, "你好")
+
+        self.assertTrue(result["submitted"])
+        self.assertTrue(result["send_success"])
+        self.assertEqual(result["verified_last_sender"], "self")
+        self.assertEqual(result["verified_last_text"], "12:45 送达 你好")
+        # Enter 被 mock 为只触发回读数据填充，不会真正清空输入框
+        self.assertFalse(result["composer_cleared_after_send"])
+
+    def test_send_to_job_links_summary_counts_verified(self):
+        module = load_module()
+        fake = {
+            "mode": "send", "job_link": self.VALID_LINK, "message": "你好",
+            "submitted": True, "send_success": True,
+            "verified_last_sender": "self", "verified_last_text": "你好",
+            "post_send_visible": True, "composer_cleared_after_send": True,
+            "sent_at": "now",
+        }
+        cdp = mock.Mock()
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+             mock.patch.object(module.time, "sleep"), \
+             mock.patch.object(module, "send_one_job_link",
+                               return_value=fake):
+            summary = module.send_to_job_links(self.VALID_LINK, "你好")
+        self.assertEqual(summary["sent"], 1)
+        self.assertEqual(summary["sent_verified"], 1)
+
+
+    def test_read_one_chat_prefer_sidebar_switches_when_found(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.eval_js.side_effect = lambda script, sid: (
+            json.dumps([{
+                "index": 3, "name": "刘姗", "company": "新公司", "title": "HR",
+                "read_status": "已读", "last_time": "13:02",
+                "last_message_preview": "你好", "selected": False,
+                "avatar": "",
+            }], ensure_ascii=False)
+            if ".friend-content" in script else None
+        )
+
+        with mock.patch.object(module, "attach_active_inbox_target",
+                               return_value=("chat-target", "chat-session")), \
+             mock.patch.object(module, "_chat_page_risk_check"), \
+             mock.patch.object(module, "_capture_native_items_temp",
+                               return_value=[{
+                                   "job_id": "52b2610d4a110fa70nF62NW1EVJQ",
+                                   "recruiter_name": "刘姗", "company": "新公司",
+                                   "filtered": False,
+                               }]), \
+             mock.patch.object(module, "_click_sidebar_conversation",
+                               return_value=4) as click_side, \
+             mock.patch.object(module, "_read_chat_payload",
+                               return_value={
+                                   "rendered_entries": [
+                                       {"type": "incoming_text", "text": "你好",
+                                        "image_count": 0, "link_count": 0,
+                                        "class_hint": "message-item"},
+                                   ],
+                               }), \
+             mock.patch.object(module.time, "sleep"):
+            result, via = module._read_one_chat_prefer_sidebar(
+                cdp, self.VALID_LINK, "52b2610d4a110fa70nF62NW1EVJQ", 10)
+
+        self.assertEqual(via, "sidebar")
+        self.assertEqual(result["switch_index"], 3)
+        self.assertEqual(result["rendered_message_count"], 1)
+        click_side.assert_called_once_with(cdp, "chat-session", 3)
+
+    def test_read_one_chat_prefer_sidebar_falls_back_to_job_link(self):
+        module = load_module()
+        cdp = mock.Mock()
+        fake_read = {"mode": "read-chat", "rendered_message_count": 0,
+                     "messages": [], "message_type_counts": {},
+                     "sender_counts": {}, "scope": "", "read_at": "now"}
+
+        with mock.patch.object(module, "attach_active_inbox_target",
+                               side_effect=RuntimeError("未找到唯一消息页")), \
+             mock.patch.object(module, "read_one_job_link",
+                               return_value=fake_read) as read_one:
+            result, via = module._read_one_chat_prefer_sidebar(
+                cdp, self.VALID_LINK, "52b2610d4a110fa70nF62NW1EVJQ", 10)
+
+        self.assertEqual(via, "job_link")
+        self.assertEqual(read_one.call_args.args[1], self.VALID_LINK)
+        self.assertEqual(result["mode"], "read-chat")
+
+    def test_read_chat_switch_or_open_prefers_sidebar_and_reports_via(self):
+        module = load_module()
+        cdp = mock.Mock()
+        fake_sidebar = {
+            "mode": "read-chat", "switch_index": 0,
+            "rendered_message_count": 2, "messages": [],
+            "message_type_counts": {}, "sender_counts": {},
+            "scope": "", "read_at": "now",
+        }
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+             mock.patch.object(module.time, "sleep"), \
+             mock.patch.object(module, "_read_one_chat_prefer_sidebar",
+                               return_value=(fake_sidebar, "sidebar")):
+            summary = module.read_chat_switch_or_open(self.VALID_LINK)
+
+        self.assertEqual(summary["mode"], "read-chat")
+        self.assertEqual(summary["read"], 1)
+        self.assertEqual(summary["via_sidebar"], 1)
+        self.assertEqual(summary["via_job_link"], 0)
+        self.assertEqual(summary["results"][0]["entered_via"], "sidebar")
+
+    def test_read_chat_switch_or_open_reports_job_link_fallback(self):
+        module = load_module()
+        cdp = mock.Mock()
+        fake_read = {
+            "mode": "read-chat", "rendered_message_count": 3, "messages": [],
+            "message_type_counts": {}, "sender_counts": {},
+            "scope": "", "read_at": "now",
+        }
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+             mock.patch.object(module.time, "sleep"), \
+             mock.patch.object(module, "_read_one_chat_prefer_sidebar",
+                               return_value=(fake_read, "job_link")):
+            summary = module.read_chat_switch_or_open(self.VALID_LINK)
+
+        self.assertEqual(summary["via_sidebar"], 0)
+        self.assertEqual(summary["via_job_link"], 1)
+        self.assertEqual(summary["results"][0]["entered_via"], "job_link")
+
+    def test_read_chat_switch_or_open_aborts_on_risk_control(self):
+        module = load_module()
+        cdp = mock.Mock()
+        processed = []
+
+        def fake_prefer(cdp_arg, link, job_id, max_entries):
+            processed.append(link)
+            raise module.RiskControlError("检测到 BOSS 风控提示：环境异常")
+
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+             mock.patch.object(module.time, "sleep"), \
+             mock.patch.object(module, "_read_one_chat_prefer_sidebar",
+                               side_effect=fake_prefer):
+            summary = module.read_chat_switch_or_open(
+                f"{self.VALID_LINK},{self.SECOND_LINK}")
+
+        self.assertEqual(summary["aborted"], 1)
+        self.assertEqual(len(processed), 1)
 
 
 if __name__ == "__main__":

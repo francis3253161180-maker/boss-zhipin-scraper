@@ -1,13 +1,13 @@
 ---
 name: boss-zhipin-scraper
 description: "Low-frequency personal job-search workflow for BOSS直聘 via an already logged-in Chrome CDP profile. Searches job lists, captures native page responses, fetches selected JD details, and outputs JSON/CSV."
-version: 2.9.0
+version: 2.11.0
 author: eatmoreduck
 license: MIT
 platforms: [windows, macos, linux]
 ---
 
-# BOSS直聘职位抓取工具 v2.9
+# BOSS直聘职位抓取工具 v2.11
 
 Use this skill only for personal job-search research. Keep list searches small and detail requests serial. Do not add proxy rotation, fingerprint spoofing, CAPTCHA bypass, or bulk crawling.
 
@@ -54,6 +54,12 @@ Timing policy: wait 8–15 seconds between search pages; wait 5–8 seconds afte
 .\boss-zhipin-scraper\boss.ps1 --mode inbox-discover --stdout
 .\boss-zhipin-scraper\boss.ps1 --mode inbox-read-active --expect-contact "刘姗" --stdout
 .\boss-zhipin-scraper\boss.ps1 --mode inbox-send-active --expect-contact "杨先生" --message "你好" --confirm-send --stdout
+.\boss-zhipin-scraper\boss.ps1 --mode send --content "您好，我对该岗位很感兴趣..." --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=...&securityId=..." --stdout
+.\boss-zhipin-scraper\boss.ps1 --mode read --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=...&securityId=..." --stdout
+.\boss-zhipin-scraper\boss.ps1 --mode read --list --stdout
+.\boss-zhipin-scraper\boss.ps1 --mode read --chat --stdout
+.\boss-zhipin-scraper\boss.ps1 --mode read --chat --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=...&securityId=..." --stdout
+.\boss-zhipin-scraper\boss.ps1 --mode read --chat --switch-index 0,1 --stdout
 .\boss-zhipin-scraper\boss.ps1 --mode detail --job_id id1,id2 --detail-output .\job-data\details.json
 .\boss-zhipin-scraper\boss.ps1 --mode detail --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=...&securityId=..." --stdout
 .\boss-zhipin-scraper\boss.ps1 --mode detail --job_id id1,id2 --stream-json
@@ -69,7 +75,10 @@ cp boss-zhipin-scraper/scripts/job_summary.py ~/.hermes/skills/data-science/boss
 
 `homepage` output contains a flattened deduplicated `jobs` list plus `sections.selected` and `sections.latest`. Each job keeps `homepage_sections` and native response provenance so repeated jobs remain traceable.
 
-`inbox` only returns job-progress metadata: company, linked job, unread count, last activity time and opaque conversation IDs. `inbox-discover` may summarize JSON/WebSocket envelope keys, but never recruiter names, chat previews, or message bodies. Do not implement automatic message sending; drafts may be prepared separately, but an actual send must be a single, explicit user-confirmed action.
+`inbox` only returns job-progress metadata: company, linked job, unread count, last activity time and opaque conversation IDs. `inbox-discover` may summarize JSON/WebSocket envelope keys, but never recruiter names, chat previews, or message bodies.
+
+`--mode send` is the explicit batch-delivery sender the user asked for: it opens each `--job_link` JD in the dedicated Chrome, clicks `立即沟通`/`继续沟通` so BOSS itself opens and switches to the conversation, verifies the rendered composer contains the exact `--content`, then sends it with a trusted Enter sequence (rawKeyDown + char + keyUp). After sending it keeps the chat page open and immediately reads back the last rendered history row: when it matches `--content`, `send_success=true`, and the result also carries `verified_last_sender` (self/other) and `verified_last_text` (raw read-back, truncated to 200 chars); the batch summary adds `sent_verified`. It runs serially with 8-15s pacing and sends each job at most once. Existing fields `post_send_visible` (outgoing-text count confirmed by a bounded ≤6s poll, timestamp-aware) and `composer_cleared_after_send` remain; a failed confirmation is reported but never auto-resends. Risk-control markers abort the whole batch immediately. A 5-second pre-flight countdown with Ctrl+C precedes the first send.
+`--mode read` has three forms. `--list` captures the native conversation-list response (raw `getGeekFriendList.json` items, so it never reloads the open chat page) and merges it with the rendered sidebar rows to return every conversation's name, avatar, company, linked `job_link`, read/delivered status, last message (sender `self`/`other` via `last_message_sender`, read state 已读/送达/未读 via `last_message_read`, text, time), unread count, pinned/selected flags, and a 0-based sidebar `index` that can be fed straight into `--chat --switch-index`. `--chat` attaches to the already open chat page and reads only the currently selected conversation (never reopens, never switches). `--chat --job_link` prefers switching the matching sidebar row on the already open chat page with trusted mouse events and only falls back to opening the JD and clicking `立即沟通`/`继续沟通` when switching fails or no chat page is open; each result carries `entered_via` (`sidebar`/`job_link`) and the summary reports `via_sidebar`/`via_job_link`. `--chat --switch-index 0,1` clicks the rendered sidebar rows directly with trusted mouse events (BOSS's SPA ignores element.click()) and reads each history without reopening any job_link. Every row is tagged with `sender` direction (`self` = 自己发送, `other` = 对方发送, plus `system`/`platform`/`attachment`/`unknown`). All read forms are stdout-only (`--stdout`), never type or send, and do not scroll for older history; risk-control markers abort the batch.
 
 `inbox-read-active` is an explicit, read-only exception for one conversation the user has already opened in the dedicated Chrome. It requires `--expect-contact`, verifies that name appears in the **main message-pane header** rather than merely in the contact list, then returns only the currently rendered logical message rows and their broad type (`incoming_text`, `outgoing_text`, `system_event`, `platform_card`, or attachment). It does not navigate, click, scroll for older history, write a local content file, or send a message.
 
@@ -95,8 +104,9 @@ The inbox workflow is deliberately split into **progress monitoring**, **one nam
 - Never bulk-read chat bodies. A history read requires a user-named `conversation_id` or an unambiguous company + job pair. For `inbox-read-active`, the expected name must be verified inside the main message-pane header; a match in the left contact list is insufficient.
 - Reading an unread conversation can mark it read. Tell the user before a first read when `unread_count > 0`.
 - Never send, withdraw, forward, mark interview/exchange, reject, share a phone/WeChat, or send a resume by default.
-- An actual message requires one fresh confirmation containing the exact recipient/conversation and exact text. A previous confirmation cannot be reused for another message.
-- The sole sender is `inbox-send-active`; it has no contact search, queue, schedule, retry, attachment, resume, phone, WeChat, or status-action capability. It must operate only on a conversation the user has already selected manually in the dedicated Chrome.
+- An actual message via `inbox-send-active` requires one fresh confirmation containing the exact recipient/conversation and exact text. `--mode send` treats the user-supplied `--job_link` list plus exact `--content` as the batch authorization; it still shows a pre-flight summary and countdown before the first send.
+- The two senders are `inbox-send-active` (single manually selected conversation) and `--mode send` (explicit batch over `--job_link`). Neither has contact search, schedule, attachment, resume, phone, WeChat, or status-action capability; `--mode send` never retries a failed send.
+- `--mode read` is read-only chat retrieval: `--list` (sidebar conversation summaries), `--chat` (current selection on the open chat page), `--chat --job_link` (enter from a JD), or `--chat --switch-index N` (direct sidebar switch on the open page). It never sends, never auto-scrolls older history, and never writes chat bodies to disk (stdout-only). Reading an unread conversation may mark it read; tell the user before a first read of a conversation with known `unread_count > 0`.
 - Before implementing a sender, first observe the selected conversation's native protocol structure in read-only mode. Do not guess or replay a WebSocket payload.
 - Stop if BOSS returns `code 31`, `code 37`, an authentication/verification screen, or another unexpected business error such as `code 7`; do not probe repeatedly.
 

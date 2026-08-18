@@ -15,6 +15,8 @@
 #   .\boss.ps1 --mode inbox-discover --stdout  # 只读协议字段结构，不输出私聊正文
 #   .\boss.ps1 --mode inbox-read-active --expect-contact "刘姗" --stdout  # 仅读当前已选会话
 #   .\boss.ps1 --mode inbox-send-active --expect-contact "杨先生" --message "你好" --confirm-send --stdout  # 单次已确认发送
+#   .\boss.ps1 --mode send --content "您好，我对该岗位很感兴趣..." --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout  # 批量投递：打开 JD → 点立即沟通/继续沟通 → 自动发送
+#   .\boss.ps1 --mode read --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout  # 读取 JD 对应会话当前聊天历史（区分 对方/自己 发送；只读不发送）
 #   $list | .\boss.ps1 --mode detail --job_id id1,id2 [--stdout]  # 管道自动读 stdin（无需任何参数）
 #   .\boss.ps1 --mode detail --job_id id1,id2 --stdout            # 无管道：自动加载最新列表
 #   .\boss.ps1 --mode detail --job_link "https://www.zhipin.com/job_detail/xxx.html?lid=..&securityId=.." --stdout  # 直接传完整链接，免列表文件
@@ -24,19 +26,21 @@
 # tells the engine to read the list from stdin (--input parameter removed).
 #
 # If blocked by execution policy:
-#   powershell -ExecutionPolicy Bypass -File .\boss.ps1 --mode search --keyword "agent开发" --city 北京
+#   pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\boss.ps1 --mode search --keyword "agent开发" --city 北京
 
 $ErrorActionPreference = 'Continue'
 Push-Location $PSScriptRoot
 
-# --- save original proxy env vars ---
+# --- save original process settings ---
 $saved = @{
-    'HTTP_PROXY'     = $env:HTTP_PROXY
-    'HTTPS_PROXY'    = $env:HTTPS_PROXY
-    'ALL_PROXY'      = $env:ALL_PROXY
-    'BOSS_RESULT_DIR' = $env:BOSS_RESULT_DIR
-    'BOSS_LIST_STDIN' = $env:BOSS_LIST_STDIN
+    'HTTP_PROXY'       = $env:HTTP_PROXY
+    'HTTPS_PROXY'      = $env:HTTPS_PROXY
+    'ALL_PROXY'        = $env:ALL_PROXY
+    'BOSS_RESULT_DIR'  = $env:BOSS_RESULT_DIR
+    'BOSS_LIST_STDIN'  = $env:BOSS_LIST_STDIN
+    'PYTHONIOENCODING' = $env:PYTHONIOENCODING
 }
+$savedOutputEncoding = $OutputEncoding
 
 # --- clear proxy for this process tree (avoid BOSS code 37) ---
 $env:PYTHONIOENCODING = 'utf-8'   # avoid GBK console crash on Windows
@@ -71,7 +75,7 @@ try {
     $code = $LASTEXITCODE
 }
 finally {
-    # --- restore original proxy env vars ---
+    # --- restore original process settings so Codex/other commands are unaffected ---
     foreach ($k in $saved.Keys) {
         if ($null -eq $saved[$k]) {
             Remove-Item "Env:$k" -ErrorAction SilentlyContinue
@@ -80,6 +84,7 @@ finally {
             Set-Item "Env:$k" $saved[$k]
         }
     }
+    $OutputEncoding = $savedOutputEncoding
     Pop-Location
 }
 

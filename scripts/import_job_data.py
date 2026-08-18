@@ -14,6 +14,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 SCHEMA = """
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS search_runs (
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
     job_link TEXT,
+    canonical_job_link TEXT,
     company TEXT,
     title TEXT,
     city TEXT,
@@ -447,6 +449,26 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     for column, statement in migrations.items():
         if column not in columns:
             conn.execute(statement)
+
+    job_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "canonical_job_link" not in job_columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN canonical_job_link TEXT")
+
+    for job_id, job_link in conn.execute(
+        "SELECT job_id, job_link FROM jobs WHERE canonical_job_link IS NULL"
+    ):
+        conn.execute(
+            "UPDATE jobs SET canonical_job_link=? WHERE job_id=?",
+            (canonical_job_link(job_link), job_id),
+        )
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_canonical_job_link
+        ON jobs(canonical_job_link)
+        WHERE canonical_job_link IS NOT NULL
+        """
+    )
     # Re-run the idempotent schema now that all view columns exist.
     conn.executescript(SCHEMA)
 
@@ -455,32 +477,48 @@ def company_of(item: dict[str, Any]) -> str | None:
     return text(item.get("company") or item.get("boss_name"))
 
 
+def canonical_job_link(value: Any) -> str | None:
+    """Return the stable job page identity, excluding expiring access tokens."""
+    raw_link = text(value)
+    if not raw_link:
+        return None
+    parsed = urlsplit(raw_link)
+    if not parsed.scheme or not parsed.netloc or not parsed.path:
+        return None
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
 def upsert_job(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str) -> str:
-    job_id = text(item.get("job_id"))
-    if not job_id:
-        raise ValueError("岗位缺少 job_id，无法安全去重")
+    raw_job_link = text(item.get("job_link") or item.get("link"))
+    stable_job_link = canonical_job_link(raw_job_link)
+    if not stable_job_link:
+        raise ValueError("岗位缺少可用 job_link，无法安全去重")
+    incoming_job_id = text(item.get("job_id")) or stable_job_link
     location = text(item.get("location")) or ""
     parts = location.split("·")
     city = parts[0] if parts else None
     district = "·".join(parts[1:]) if len(parts) > 1 else None
     company = company_of(item)
     existing_row = conn.execute(
-        "SELECT latest_snapshot_json FROM jobs WHERE job_id=?", (job_id,)
+        "SELECT job_id, latest_snapshot_json FROM jobs WHERE canonical_job_link=?",
+        (stable_job_link,),
     ).fetchone()
+    job_id = existing_row[0] if existing_row else incoming_job_id
     try:
-        existing_snapshot = json.loads(existing_row[0]) if existing_row and existing_row[0] else {}
+        existing_snapshot = json.loads(existing_row[1]) if existing_row and existing_row[1] else {}
     except json.JSONDecodeError:
         existing_snapshot = {}
     snapshot = json_text({**existing_snapshot, **item})
     conn.execute(
         """
         INSERT INTO jobs (
-            job_id, job_link, company, title, city, district, salary_text,
+            job_id, job_link, canonical_job_link, company, title, city, district, salary_text,
             company_scale, company_stage, industry, first_seen_at, last_seen_at,
             current_status, latest_snapshot_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered', ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered', ?)
         ON CONFLICT(job_id) DO UPDATE SET
             job_link=excluded.job_link,
+            canonical_job_link=excluded.canonical_job_link,
             company=COALESCE(excluded.company, jobs.company),
             title=COALESCE(excluded.title, jobs.title),
             city=COALESCE(excluded.city, jobs.city),
@@ -494,7 +532,8 @@ def upsert_job(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str) -> 
         """,
         (
             job_id,
-            text(item.get("job_link") or item.get("link")),
+            raw_job_link,
+            stable_job_link,
             company,
             text(item.get("title")),
             city,
