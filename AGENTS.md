@@ -35,10 +35,20 @@ The wrapper must preserve the caller's PowerShell working directory. The dedicat
 - File writes are incremental and atomic. A partial JSON file must never replace a valid previous result.
 - Direct `--job_link` detail mode may fill missing list metadata from the rendered detail page; fields that are not present remain empty rather than being inferred.
 
+## Skill package maintenance
+
+This repo has two roles: the repo root is the runnable project, and `skills/boss-tool/` is a self-contained, installable Codex skill package (Chinese command manual + `boss.ps1` + core scripts + city codes).
+
+- The authoritative files live in the repo root (`boss.ps1`, `scripts/boss_cdp_raw.py`, `scripts/job_summary.py`, `data/city_codes.json`, `requirements.txt`, `LICENSE`). Never edit the copies under `skills/boss-tool/` directly.
+- After any code or CLI change, refresh the package with `.\scripts\sync-skill.ps1` before committing. Add `-SyncLocalSkill` to also mirror `skills/boss-tool/SKILL.md` into the author's local `~/.codex/skills/boss-tool/` (Codex reloads skills on restart).
+- `skills/boss-tool/SKILL.md` is the canonical Chinese command manual and must stay identical to the local personal skill copies (`SKILL.md` / `SKILL.md.new`).
+- Others install the skill from GitHub with the skill installer: `--repo francis3253161180-maker/boss-zhipin-scraper --ref master --path skills/boss-tool`. The installed skill is self-contained and needs no separate repo clone.
+- Keep the local repo as the maintenance and runtime workspace. Local-only branches (e.g. `codex`, `agent/*`) must be pushed to `origin` before any local cleanup; they are the recovery baseline. Dedicated Chrome login/profile live outside the repo (`~/.boss-zhipin-scraper/chrome-profile`), so deleting or re-cloning the repo does not affect login state.
+
 ## Change and test rules
 
 - Keep the core logic in `scripts/boss_cdp_raw.py` unless a change clearly requires a new module.
-- Update `README.md`, `README.en.md`, `SKILL.md`, and `CHANGELOG.md` when CLI behavior changes.
+- Update `README.md`, `README.en.md`, `SKILL.md`, and `CHANGELOG.md` when CLI behavior changes, then run `scripts/sync-skill.ps1` to refresh `skills/boss-tool/`.
 - Add mock tests for CDP event handling, native response parsing, direct-link metadata fallback, stream output, and atomic writes.
 - Run `python -m py_compile scripts/boss_cdp_raw.py` and the relevant unittest modules before real BOSS validation.
 - Keep version declarations synchronized across `scripts/boss_cdp_raw.py`, `pyproject.toml`, `SKILL.md`, and README files.
