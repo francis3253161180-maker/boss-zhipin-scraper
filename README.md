@@ -7,6 +7,8 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 ![Version](https://img.shields.io/badge/version-2.11.0-orange.svg)
 
+> ⭐ **个人增强 fork**：本仓库是 [eatmoreduck/boss-zhipin-scraper](https://github.com/eatmoreduck/boss-zhipin-scraper) 的个人维护增强版，新增 **批量投递（`--mode send`）、会话读取（`--mode read`）与自包含的 Codex 技能包（`skills/boss-tool/`）**，可一键安装为本地 Codex 技能。
+
 一个面向个人求职研究的低频职位工具：通过 Chrome DevTools Protocol 连接隔离的已登录 Chrome，导航到目标搜索页并捕获页面自身的 `joblist.json` 响应，输出含**明文薪资**的职位数据（JSON / CSV）。详情页串行抓取并支持流式 NDJSON 输出。
 
 > 📌 **一句话介绍**：不用 Selenium/Playwright，直接通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调搜索 API，输出含明文薪资的 JSON/CSV，并生成薪资分布、技能词频和求职材料优化提示词。

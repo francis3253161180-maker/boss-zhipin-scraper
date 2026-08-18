@@ -7,6 +7,8 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 ![Version](https://img.shields.io/badge/version-2.11.0-orange.svg)
 
+> ⭐ **Personal enhanced fork**: this repository is a personally maintained fork of [eatmoreduck/boss-zhipin-scraper](https://github.com/eatmoreduck/boss-zhipin-scraper), adding **batch delivery (`--mode send`), conversation reading (`--mode read`), and a self-contained Codex skill package (`skills/boss-tool/`)** installable into local Codex.
+
 A low-frequency personal job-search tool for [zhipin.com](https://www.zhipin.com). It connects to an isolated already-logged-in Chrome via CDP, navigates to the target search page, and captures the page's native `joblist.json` response for plaintext salary data. Detail pages are fetched serially and can emit streaming NDJSON.
 
 > 📌 **In one sentence**: no Selenium/Playwright — connect to your logged-in Chrome over CDP, hit the search API with the real session, get JSON/CSV with plaintext salaries, plus salary-distribution, skill-frequency stats and a résumé-optimization prompt.
